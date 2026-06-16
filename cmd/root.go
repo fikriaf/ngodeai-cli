@@ -19,7 +19,7 @@ var (
 	cwd     string
 	prompt  string
 	debug   bool
-	version string = "0.2.0"
+	version string = "0.4.0"
 )
 
 var rootCmd = &cobra.Command{
@@ -85,6 +85,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create app: %w", err)
 	}
+	defer a.Close()
 
 	// Check if provider is configured
 	if a.Agent == nil {

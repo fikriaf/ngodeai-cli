@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
@@ -61,8 +62,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userContent string) (
 		return "", fmt.Errorf("failed to create user message: %w", err)
 	}
 
-	// Get all messages for this session
-	allMessages, err := a.messages.List(sessionID)
+	// Check if we need to compact before LLM call
+	if _, err := a.CompactIfNeeded(ctx, sessionID); err != nil {
+		// Log but continue - we don't want to fail the request
+		fmt.Fprintf(os.Stderr, "warning: compaction check failed: %v\n", err)
+	}
+
+	// Get messages (using compacted version if available)
+	allMessages, err := a.GetCompactedMessages(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("failed to list messages: %w", err)
 	}
@@ -122,7 +129,15 @@ func (a *Agent) StreamRun(ctx context.Context, sessionID string, userContent str
 		// tool-result parts are available to the provider without
 		// round-tripping through the DB (whose ContentPart
 		// deserialiser may not handle all part types yet).
-		dbMessages, err := a.messages.List(sessionID)
+
+		// Check if we need to compact before LLM call
+		if _, err := a.CompactIfNeeded(ctx, sessionID); err != nil {
+			// Log but continue - we don't want to fail the request
+			fmt.Fprintf(os.Stderr, "warning: compaction check failed: %v\n", err)
+		}
+
+		// Get messages (using compacted version if available)
+		dbMessages, err := a.GetCompactedMessages(sessionID)
 		if err != nil {
 			errCh <- fmt.Errorf("failed to list messages: %w", err)
 			return

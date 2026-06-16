@@ -10,32 +10,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fikriaf/ngodeai-cli/internal/app"
+	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/theme"
 )
 
-// Styles
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("205")).
-			Padding(0, 1)
+// activeDialog tracks which dialog overlay (if any) is currently shown.
+type activeDialog int
 
-	userStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("86")).
-			Bold(true)
-
-	assistantStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("212")).
-			Bold(true)
-
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241")).
-			Padding(0, 1)
-
-	// streamingCursor is appended to the last assistant message while streaming
-	// to give the user a visual "typing" indicator.
-	streamingCursor = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("212")).
-			Render(" ▌")
+const (
+	noDialog    activeDialog = iota
+	modelDialog              // Model selector (Ctrl+O)
+	themeDialog              // Theme picker (Ctrl+T)
+	fileDialog               // File attachment picker (Ctrl+F)
 )
 
 // Model is the main TUI model
@@ -55,6 +42,15 @@ type Model struct {
 	streaming       bool
 	streamContentCh <-chan string
 	streamErrCh     <-chan error
+
+	// Dialog state
+	activeDialog  activeDialog
+	modelSelector dialog.ModelSelector
+	themePicker   dialog.ThemePicker
+	filePicker    dialog.FilePicker
+
+	// Theme
+	currentTheme string
 }
 
 // ChatMessage represents a displayed message
@@ -66,7 +62,7 @@ type ChatMessage struct {
 // New creates a new TUI model
 func New(a *app.App) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Ask anything... (Ctrl+C to quit)"
+	ta.Placeholder = "Ask anything... (Ctrl+O: model · Ctrl+T: theme · Ctrl+F: file · Ctrl+C: quit)"
 	ta.Focus()
 	ta.Prompt = "\u2503 "
 	ta.CharLimit = 4096
@@ -84,6 +80,7 @@ func New(a *app.App) Model {
 		messages: []ChatMessage{
 			{Role: "system", Content: "Welcome to NgodeAI CLI! Type your question and press Enter."},
 		},
+		currentTheme: "default",
 	}
 }
 
@@ -97,11 +94,118 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		vpCmd tea.Cmd
 	)
 
+	// ── 1. Always handle dialog result messages ──────────────────────
+	switch msg := msg.(type) {
+	case dialog.ModelSelectedMsg:
+		m.activeDialog = noDialog
+		m.handleModelSelection(msg)
+		return m, nil
+
+	case dialog.ModelCloseMsg:
+		m.activeDialog = noDialog
+		return m, nil
+
+	case dialog.ThemeSelectedMsg:
+		m.activeDialog = noDialog
+		m.currentTheme = msg.Name
+		m.messages = append(m.messages, ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf("✓ Theme changed to \"%s\"", msg.Name),
+		})
+		m.viewport.SetContent(m.renderMessages())
+		return m, nil
+
+	case dialog.ThemeCloseMsg:
+		m.activeDialog = noDialog
+		return m, nil
+
+	case dialog.FileSelectedMsg:
+		m.activeDialog = noDialog
+		// Insert file path into the textarea
+		current := m.textarea.Value()
+		if current != "" {
+			current += " "
+		}
+		m.textarea.SetValue(current + msg.Path)
+		return m, nil
+
+	case dialog.FileCloseMsg:
+		m.activeDialog = noDialog
+		return m, nil
+	}
+
+	// ── 2. Always handle window resize (for both main and dialog) ────
+	if wsMsg, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width = wsMsg.Width
+		m.height = wsMsg.Height
+
+		headerHeight := 3
+		footerHeight := 5
+		verticalMarginHeight := headerHeight + footerHeight
+
+		if !m.ready {
+			m.viewport = viewport.New(wsMsg.Width-4, wsMsg.Height-verticalMarginHeight)
+			m.viewport.YPosition = headerHeight
+			m.ready = true
+		} else {
+			m.viewport.Width = wsMsg.Width - 4
+			m.viewport.Height = wsMsg.Height - verticalMarginHeight
+		}
+
+		m.textarea.SetWidth(wsMsg.Width - 4)
+
+		// Also resize active dialog
+		switch m.activeDialog {
+		case modelDialog:
+			m.modelSelector.SetSize(wsMsg.Width, wsMsg.Height)
+		case themeDialog:
+			// themePicker doesn't need SetSize
+		case fileDialog:
+			// filePicker doesn't need SetSize
+		}
+
+		// If dialog is active, route WindowSizeMsg to it and return
+		if m.activeDialog != noDialog {
+			return m.routeToActiveDialog(msg)
+		}
+	}
+
+	// ── 3. If a dialog is active, route all other messages to it ─────
+	if m.activeDialog != noDialog {
+		return m.routeToActiveDialog(msg)
+	}
+
+	// ── 4. Normal TUI handling (no dialog active) ────────────────────
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "ctrl+d":
 			return m, tea.Quit
+
+		case "ctrl+o":
+			// Open model selector
+			m.activeDialog = modelDialog
+			models := m.buildModelItems()
+			m.modelSelector = dialog.NewModelSelector(models)
+			m.modelSelector.SetSize(m.width, m.height)
+			return m, m.modelSelector.Init()
+
+		case "ctrl+t":
+			// Open theme picker
+			m.activeDialog = themeDialog
+			themes := m.buildThemeItems()
+			m.themePicker = dialog.NewThemePicker(themes, m.currentTheme)
+			return m, m.themePicker.Init()
+
+		case "ctrl+f":
+			// Open file picker
+			m.activeDialog = fileDialog
+			startDir := "."
+			if m.app.Config != nil && m.app.Config.WorkingDir != "" {
+				startDir = m.app.Config.WorkingDir
+			}
+			m.filePicker = dialog.NewFilePicker(startDir)
+			return m, m.filePicker.Init()
 
 		case "enter":
 			if m.textarea.Value() != "" && !m.loading {
@@ -120,30 +224,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-		headerHeight := 3
-		footerHeight := 5
-		verticalMarginHeight := headerHeight + footerHeight
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width-4, msg.Height-verticalMarginHeight)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width - 4
-			m.viewport.Height = msg.Height - verticalMarginHeight
-		}
-
-		m.textarea.SetWidth(msg.Width - 4)
-
 	// ── Streaming messages ────────────────────────────────────────
 	case streamSetupMsg:
-		// Stream channels are ready; add a placeholder assistant message
 		if msg.err != nil {
-			// Setup failed → fall back to non-streaming
 			m.streaming = false
 			return m, m.sendMessage(msg.content)
 		}
@@ -156,7 +239,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.waitForStreamChunk()
 
 	case streamChunkMsg:
-		// Accumulate the chunk into the current (last) assistant message
 		if len(m.messages) > 0 {
 			last := &m.messages[len(m.messages)-1]
 			if last.Role == "assistant" {
@@ -203,12 +285,175 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(tiCmd, vpCmd)
 }
 
+// routeToActiveDialog forwards a message to the currently active dialog.
+func (m Model) routeToActiveDialog(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch m.activeDialog {
+	case modelDialog:
+		var cmd tea.Cmd
+		m.modelSelector, cmd = m.modelSelector.Update(msg)
+		return m, cmd
+	case themeDialog:
+		var cmd tea.Cmd
+		m.themePicker, cmd = m.themePicker.Update(msg)
+		return m, cmd
+	case fileDialog:
+		var cmd tea.Cmd
+		m.filePicker, cmd = m.filePicker.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// getConfiguredProviders returns a map of providers that have API keys set.
+func (m Model) getConfiguredProviders() map[string]bool {
+	configured := make(map[string]bool)
+	if m.app.Config != nil {
+		for name, p := range m.app.Config.Providers {
+			if p.APIKey != "" {
+				configured[name] = true
+			}
+		}
+	}
+	return configured
+}
+
+// buildModelItems creates a list of available models from configured providers
+func (m Model) buildModelItems() []dialog.ModelItem {
+	var items []dialog.ModelItem
+	
+	// Add default models for each provider
+	models := map[string][]dialog.ModelItem{
+		"openai": {
+			{Provider: "openai", Name: "gpt-4-turbo", ContextWindow: 128000},
+			{Provider: "openai", Name: "gpt-4", ContextWindow: 8192},
+			{Provider: "openai", Name: "gpt-3.5-turbo", ContextWindow: 16385},
+		},
+		"anthropic": {
+			{Provider: "anthropic", Name: "claude-3-5-sonnet-20241022", ContextWindow: 200000},
+			{Provider: "anthropic", Name: "claude-3-opus-20240229", ContextWindow: 200000},
+			{Provider: "anthropic", Name: "claude-3-haiku-20240307", ContextWindow: 200000},
+		},
+		"gemini": {
+			{Provider: "gemini", Name: "gemini-2.0-flash", ContextWindow: 1000000},
+			{Provider: "gemini", Name: "gemini-1.5-pro", ContextWindow: 2000000},
+			{Provider: "gemini", Name: "gemini-1.5-flash", ContextWindow: 1000000},
+		},
+	}
+	
+	if m.app.Config != nil {
+		for name, p := range m.app.Config.Providers {
+			if p.APIKey != "" {
+				if providerModels, ok := models[name]; ok {
+					items = append(items, providerModels...)
+				}
+			}
+		}
+	}
+	
+	return items
+}
+
+// buildThemeItems creates a list of available themes
+func (m Model) buildThemeItems() []dialog.ThemeItem {
+	return []dialog.ThemeItem{
+		{Name: "default", Preview: []string{"#ffffff", "#000000", "#3b82f6", "#10b981"}},
+		{Name: "catppuccin", Preview: []string{"#cdd6f4", "#1e1e2e", "#cba6f7", "#a6e3a1"}},
+		{Name: "dracula", Preview: []string{"#f8f8f2", "#282a36", "#bd93f9", "#50fa7b"}},
+		{Name: "tokyonight", Preview: []string{"#c0caf5", "#1a1b26", "#7aa2f7", "#9ece6a"}},
+	}
+}
+
+// handleModelSelection creates a new provider for the selected model and swaps it in.
+func (m *Model) handleModelSelection(info dialog.ModelSelectedMsg) {
+	if m.app.Agent == nil {
+		m.messages = append(m.messages, ChatMessage{
+			Role:    "system",
+			Content: "⚠ No agent available. Configure a provider first.",
+		})
+		m.viewport.SetContent(m.renderMessages())
+		return
+	}
+
+	// Check if the provider has an API key
+	var apiKey string
+	if m.app.Config != nil {
+		if pCfg, ok := m.app.Config.Providers[info.Provider]; ok {
+			apiKey = pCfg.APIKey
+		}
+	}
+
+	if apiKey == "" {
+		m.messages = append(m.messages, ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf("⚠ No API key configured for %s. Set %s_API_KEY environment variable.", info.Provider, strings.ToUpper(info.Provider)),
+		})
+		m.viewport.SetContent(m.renderMessages())
+		return
+	}
+
+	// Create new provider instance
+	var p provider.Provider
+	switch info.Provider {
+	case "openai":
+		p = provider.NewOpenAI(apiKey, info.Name)
+	case "anthropic":
+		p = provider.NewAnthropic(apiKey, info.Name)
+	case "gemini":
+		p = provider.NewGemini(apiKey, info.Name)
+	default:
+		m.messages = append(m.messages, ChatMessage{
+			Role:    "system",
+			Content: fmt.Sprintf("⚠ Unknown provider: %s", info.Provider),
+		})
+		m.viewport.SetContent(m.renderMessages())
+		return
+	}
+
+	m.app.Agent.SetProvider(p)
+	m.messages = append(m.messages, ChatMessage{
+		Role:    "system",
+		Content: fmt.Sprintf("✓ Switched to %s (%s)", info.Name, info.Provider),
+	})
+	m.viewport.SetContent(m.renderMessages())
+	m.viewport.GotoBottom()
+}
+
+// formatCtxWindow formats a context window token count for display.
+func formatCtxWindow(tokens int64) string {
+	if tokens >= 1000000 {
+		return fmt.Sprintf("%.0fM", float64(tokens)/1000000)
+	}
+	return fmt.Sprintf("%.0fK", float64(tokens)/1000)
+}
+
 func (m Model) View() string {
 	if !m.ready {
 		return "\n  Initializing..."
 	}
 
-	header := titleStyle.Render("NgodeAI CLI v0.2.0")
+	// ── If a dialog is active, render it as an overlay ────────────
+	switch m.activeDialog {
+	case modelDialog:
+		return m.modelSelector.View()
+	case themeDialog:
+		return m.themePicker.View()
+	case fileDialog:
+		return m.filePicker.View()
+	}
+
+	// ── Normal chat view (theme-aware) ────────────────────────────
+	t := theme.GetTheme(m.currentTheme)
+
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(t.Primary).
+		Padding(0, 1)
+
+	statusStyle := lipgloss.NewStyle().
+		Foreground(t.TextMuted).
+		Padding(0, 1)
+
+	header := titleStyle.Render("NgodeAI CLI v0.4.0")
 
 	status := ""
 	if m.streaming {
@@ -217,12 +462,18 @@ func (m Model) View() string {
 		status = statusStyle.Render("Thinking...")
 	} else if m.app.Agent != nil {
 		modelInfo := m.app.Agent.Provider().Model()
-		status = statusStyle.Render(fmt.Sprintf("Model: %s (%s)", modelInfo.Name, modelInfo.Provider))
+		themeLabel := ""
+		if m.currentTheme != "default" {
+			themeLabel = fmt.Sprintf(" · 🎨 %s", m.currentTheme)
+		}
+		status = statusStyle.Render(fmt.Sprintf("Model: %s (%s)%s", modelInfo.Name, modelInfo.Provider, themeLabel))
 	}
 
 	footer := m.textarea.View()
 
-	separator := strings.Repeat("-", max(m.width, 1))
+	separator := strings.Repeat("─", max(m.width, 1))
+	sepStyle := lipgloss.NewStyle().Foreground(t.TextMuted)
+	separator = sepStyle.Render(separator)
 
 	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s",
 		header,
@@ -234,24 +485,44 @@ func (m Model) View() string {
 }
 
 func (m Model) renderMessages() string {
+	t := theme.GetTheme(m.currentTheme)
+
+	userMsgStyle := lipgloss.NewStyle().
+		Foreground(t.UserMsg).
+		Bold(true)
+
+	assistantMsgStyle := lipgloss.NewStyle().
+		Foreground(t.AssistantMsg).
+		Bold(true)
+
+	systemMsgStyle := lipgloss.NewStyle().
+		Foreground(t.TextMuted).
+		Padding(0, 1)
+
+	contentStyle := lipgloss.NewStyle().Padding(0, 1).MaxWidth(80)
+
+	// Streaming cursor uses the assistant message color
+	sCursor := lipgloss.NewStyle().
+		Foreground(t.AssistantMsg).
+		Render(" ▌")
+
 	var b strings.Builder
 	for i, msg := range m.messages {
 		switch msg.Role {
 		case "user":
-			b.WriteString(userStyle.Render("You"))
+			b.WriteString(userMsgStyle.Render("You"))
 			b.WriteString("\n")
-			b.WriteString(lipgloss.NewStyle().Padding(0, 1).MaxWidth(80).Render(msg.Content))
+			b.WriteString(contentStyle.Render(msg.Content))
 		case "assistant":
-			b.WriteString(assistantStyle.Render("NgodeAI"))
+			b.WriteString(assistantMsgStyle.Render("NgodeAI"))
 			b.WriteString("\n")
 			content := msg.Content
-			// Show a typing cursor on the last assistant message while streaming
 			if m.streaming && i == len(m.messages)-1 {
-				content += streamingCursor
+				content += sCursor
 			}
-			b.WriteString(lipgloss.NewStyle().Padding(0, 1).MaxWidth(80).Render(content))
+			b.WriteString(contentStyle.Render(content))
 		case "system":
-			b.WriteString(statusStyle.Render(msg.Content))
+			b.WriteString(systemMsgStyle.Render(msg.Content))
 		}
 		b.WriteString("\n\n")
 	}
@@ -268,35 +539,29 @@ func max(a, b int) int {
 // ── Streaming tea.Msg types ──────────────────────────────────────────────────
 
 // streamSetupMsg is sent once the streaming goroutine has created the session
-// and obtained the content/error channels from the agent.  On failure the
-// embedded err is non-nil and content carries the original user text so the
-// TUI can fall back to the synchronous path.
+// and obtained the content/error channels from the agent.
 type streamSetupMsg struct {
 	contentCh <-chan string
 	errCh     <-chan error
 	sessionID string
-	content   string // original user text (for fallback)
-	err       error  // non-nil if setup failed
+	content   string
+	err       error
 }
 
 // streamChunkMsg carries a single content delta from the streaming response.
 type streamChunkMsg string
 
-// streamDoneMsg signals that the stream has finished (successfully or with an
-// error).
+// streamDoneMsg signals that the stream has finished.
 type streamDoneMsg struct {
 	err error
 }
 
 // ── Streaming commands ───────────────────────────────────────────────────────
 
-// startStreaming kicks off the agent's StreamRun in a background goroutine
-// and returns a streamSetupMsg once the channels are ready.
 func (m Model) startStreaming(content string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 
-		// Create session if needed
 		sessionID := m.sessionID
 		if sessionID == "" {
 			sess, err := m.app.Sessions.Create("TUI Session")
@@ -306,7 +571,6 @@ func (m Model) startStreaming(content string) tea.Cmd {
 			sessionID = sess.ID
 		}
 
-		// Start streaming
 		contentCh, errCh := m.app.Agent.StreamRun(ctx, sessionID, content)
 		return streamSetupMsg{
 			contentCh: contentCh,
@@ -317,8 +581,6 @@ func (m Model) startStreaming(content string) tea.Cmd {
 	}
 }
 
-// waitForStreamChunk returns a tea.Cmd that blocks until the next content
-// delta or a terminal error/close arrives from the streaming channels.
 func (m Model) waitForStreamChunk() tea.Cmd {
 	contentCh := m.streamContentCh
 	errCh := m.streamErrCh
@@ -327,13 +589,10 @@ func (m Model) waitForStreamChunk() tea.Cmd {
 	}
 
 	return func() tea.Msg {
-		// Prioritise content over errors so we never lose a chunk when
-		// both channels become ready simultaneously.
 		if contentCh != nil {
 			select {
 			case chunk, ok := <-contentCh:
 				if !ok {
-					// Content channel closed – drain any deferred error
 					if errCh != nil {
 						if err, ok := <-errCh; ok && err != nil {
 							return streamDoneMsg{err: err}
@@ -346,7 +605,6 @@ func (m Model) waitForStreamChunk() tea.Cmd {
 			}
 		}
 
-		// Nothing ready yet – block on both
 		select {
 		case chunk, ok := <-contentCh:
 			if !ok {
@@ -370,19 +628,16 @@ func (m Model) waitForStreamChunk() tea.Cmd {
 
 // ── Non-streaming fallback ───────────────────────────────────────────────────
 
-// Messages for async operations (non-streaming fallback)
 type responseMsg struct {
 	content   string
 	sessionID string
 	err       error
 }
 
-// sendMessage sends a message to the LLM agent (non-streaming fallback)
 func (m Model) sendMessage(content string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 
-		// Create session if needed
 		sessionID := m.sessionID
 		if sessionID == "" {
 			sess, err := m.app.Sessions.Create("TUI Session")
@@ -392,7 +647,6 @@ func (m Model) sendMessage(content string) tea.Cmd {
 			sessionID = sess.ID
 		}
 
-		// Run the agent (non-streaming)
 		response, err := m.app.Agent.Run(ctx, sessionID, content)
 		if err != nil {
 			return responseMsg{err: err, sessionID: sessionID}

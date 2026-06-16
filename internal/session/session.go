@@ -127,6 +127,19 @@ func (s *Service) Delete(id string) error {
 	return nil
 }
 
+// UpdateSummaryMessageID updates the summary_message_id for a session
+func (s *Service) UpdateSummaryMessageID(sessionID string, summaryMessageID string) error {
+	_, err := s.db.Exec(`
+		UPDATE sessions 
+		SET summary_message_id = ?, updated_at = ?
+		WHERE id = ?
+	`, summaryMessageID, time.Now().Unix(), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to update summary message ID: %w", err)
+	}
+	return nil
+}
+
 // Subscribe returns a channel for session events
 func (s *Service) Subscribe(ctx context.Context) <-chan Event {
 	return s.broker.Subscribe(ctx)

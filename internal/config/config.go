@@ -9,11 +9,12 @@ import (
 
 // Config holds all configuration for NgodeAI
 type Config struct {
-	DataDir    string            `json:"dataDir"`
-	WorkingDir string            `json:"workingDir"`
-	Debug      bool              `json:"debug"`
-	Providers  map[string]Provider `json:"providers"`
-	AutoCompact bool             `json:"autoCompact"`
+	DataDir    string                       `json:"dataDir"`
+	WorkingDir string                       `json:"workingDir"`
+	Debug      bool                         `json:"debug"`
+	Providers  map[string]Provider          `json:"providers"`
+	AutoCompact bool                        `json:"autoCompact"`
+	MCPServers map[string]MCPServerConfig   `json:"mcpServers,omitempty"`
 }
 
 // Provider holds LLM provider configuration
@@ -21,6 +22,13 @@ type Provider struct {
 	APIKey  string `json:"apiKey"`
 	BaseURL string `json:"baseUrl,omitempty"`
 	Model   string `json:"model,omitempty"`
+}
+
+// MCPServerConfig holds configuration for an MCP server
+type MCPServerConfig struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+	Env     []string `json:"env,omitempty"`
 }
 
 // Load reads configuration from files and environment

@@ -1,0 +1,10 @@
+{
+  "debug": false,
+  "autoCompact": true,
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}
