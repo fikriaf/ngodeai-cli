@@ -30,6 +30,12 @@ var (
 	statusStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241")).
 			Padding(0, 1)
+
+	// streamingCursor is appended to the last assistant message while streaming
+	// to give the user a visual "typing" indicator.
+	streamingCursor = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("212")).
+			Render(" ▌")
 )
 
 // Model is the main TUI model
@@ -44,6 +50,11 @@ type Model struct {
 	height    int
 	sessionID string
 	err       error
+
+	// Streaming state
+	streaming       bool
+	streamContentCh <-chan string
+	streamErrCh     <-chan error
 }
 
 // ChatMessage represents a displayed message
@@ -99,6 +110,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messages = append(m.messages, ChatMessage{Role: "user", Content: content})
 				m.loading = true
 				m.viewport.GotoBottom()
+
+				// Prefer streaming; fall back to synchronous if agent is unavailable
+				if m.app.Agent != nil {
+					m.streaming = true
+					return m, m.startStreaming(content)
+				}
 				return m, m.sendMessage(content)
 			}
 		}
@@ -122,6 +139,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.textarea.SetWidth(msg.Width - 4)
 
+	// ── Streaming messages ────────────────────────────────────────
+	case streamSetupMsg:
+		// Stream channels are ready; add a placeholder assistant message
+		if msg.err != nil {
+			// Setup failed → fall back to non-streaming
+			m.streaming = false
+			return m, m.sendMessage(msg.content)
+		}
+		m.sessionID = msg.sessionID
+		m.streamContentCh = msg.contentCh
+		m.streamErrCh = msg.errCh
+		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: ""})
+		m.viewport.SetContent(m.renderMessages())
+		m.viewport.GotoBottom()
+		return m, m.waitForStreamChunk()
+
+	case streamChunkMsg:
+		// Accumulate the chunk into the current (last) assistant message
+		if len(m.messages) > 0 {
+			last := &m.messages[len(m.messages)-1]
+			if last.Role == "assistant" {
+				last.Content += string(msg)
+			}
+		}
+		m.viewport.SetContent(m.renderMessages())
+		m.viewport.GotoBottom()
+		return m, m.waitForStreamChunk()
+
+	case streamDoneMsg:
+		m.streaming = false
+		m.loading = false
+		m.streamContentCh = nil
+		m.streamErrCh = nil
+		if msg.err != nil {
+			errText := fmt.Sprintf("\n\n⚠ Error: %v", msg.err)
+			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == "assistant" {
+				m.messages[len(m.messages)-1].Content += errText
+			} else {
+				m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: fmt.Sprintf("Error: %v", msg.err)})
+			}
+		}
+		m.viewport.SetContent(m.renderMessages())
+		m.viewport.GotoBottom()
+		return m, nil
+
+	// ── Non-streaming fallback ────────────────────────────────────
 	case responseMsg:
 		m.loading = false
 		m.sessionID = msg.sessionID
@@ -148,7 +211,9 @@ func (m Model) View() string {
 	header := titleStyle.Render("NgodeAI CLI v0.2.0")
 
 	status := ""
-	if m.loading {
+	if m.streaming {
+		status = statusStyle.Render("Streaming…")
+	} else if m.loading {
 		status = statusStyle.Render("Thinking...")
 	} else if m.app.Agent != nil {
 		modelInfo := m.app.Agent.Provider().Model()
@@ -170,7 +235,7 @@ func (m Model) View() string {
 
 func (m Model) renderMessages() string {
 	var b strings.Builder
-	for _, msg := range m.messages {
+	for i, msg := range m.messages {
 		switch msg.Role {
 		case "user":
 			b.WriteString(userStyle.Render("You"))
@@ -179,7 +244,12 @@ func (m Model) renderMessages() string {
 		case "assistant":
 			b.WriteString(assistantStyle.Render("NgodeAI"))
 			b.WriteString("\n")
-			b.WriteString(lipgloss.NewStyle().Padding(0, 1).MaxWidth(80).Render(msg.Content))
+			content := msg.Content
+			// Show a typing cursor on the last assistant message while streaming
+			if m.streaming && i == len(m.messages)-1 {
+				content += streamingCursor
+			}
+			b.WriteString(lipgloss.NewStyle().Padding(0, 1).MaxWidth(80).Render(content))
 		case "system":
 			b.WriteString(statusStyle.Render(msg.Content))
 		}
@@ -195,14 +265,119 @@ func max(a, b int) int {
 	return b
 }
 
-// Messages for async operations
+// ── Streaming tea.Msg types ──────────────────────────────────────────────────
+
+// streamSetupMsg is sent once the streaming goroutine has created the session
+// and obtained the content/error channels from the agent.  On failure the
+// embedded err is non-nil and content carries the original user text so the
+// TUI can fall back to the synchronous path.
+type streamSetupMsg struct {
+	contentCh <-chan string
+	errCh     <-chan error
+	sessionID string
+	content   string // original user text (for fallback)
+	err       error  // non-nil if setup failed
+}
+
+// streamChunkMsg carries a single content delta from the streaming response.
+type streamChunkMsg string
+
+// streamDoneMsg signals that the stream has finished (successfully or with an
+// error).
+type streamDoneMsg struct {
+	err error
+}
+
+// ── Streaming commands ───────────────────────────────────────────────────────
+
+// startStreaming kicks off the agent's StreamRun in a background goroutine
+// and returns a streamSetupMsg once the channels are ready.
+func (m Model) startStreaming(content string) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+
+		// Create session if needed
+		sessionID := m.sessionID
+		if sessionID == "" {
+			sess, err := m.app.Sessions.Create("TUI Session")
+			if err != nil {
+				return streamSetupMsg{content: content, err: err}
+			}
+			sessionID = sess.ID
+		}
+
+		// Start streaming
+		contentCh, errCh := m.app.Agent.StreamRun(ctx, sessionID, content)
+		return streamSetupMsg{
+			contentCh: contentCh,
+			errCh:     errCh,
+			sessionID: sessionID,
+			content:   content,
+		}
+	}
+}
+
+// waitForStreamChunk returns a tea.Cmd that blocks until the next content
+// delta or a terminal error/close arrives from the streaming channels.
+func (m Model) waitForStreamChunk() tea.Cmd {
+	contentCh := m.streamContentCh
+	errCh := m.streamErrCh
+	if contentCh == nil && errCh == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		// Prioritise content over errors so we never lose a chunk when
+		// both channels become ready simultaneously.
+		if contentCh != nil {
+			select {
+			case chunk, ok := <-contentCh:
+				if !ok {
+					// Content channel closed – drain any deferred error
+					if errCh != nil {
+						if err, ok := <-errCh; ok && err != nil {
+							return streamDoneMsg{err: err}
+						}
+					}
+					return streamDoneMsg{}
+				}
+				return streamChunkMsg(chunk)
+			default:
+			}
+		}
+
+		// Nothing ready yet – block on both
+		select {
+		case chunk, ok := <-contentCh:
+			if !ok {
+				if errCh != nil {
+					if err, ok := <-errCh; ok && err != nil {
+						return streamDoneMsg{err: err}
+					}
+				}
+				return streamDoneMsg{}
+			}
+			return streamChunkMsg(chunk)
+
+		case err, ok := <-errCh:
+			if !ok {
+				return streamDoneMsg{}
+			}
+			return streamDoneMsg{err: err}
+		}
+	}
+}
+
+// ── Non-streaming fallback ───────────────────────────────────────────────────
+
+// Messages for async operations (non-streaming fallback)
 type responseMsg struct {
 	content   string
 	sessionID string
 	err       error
 }
 
-// sendMessage sends a message to the LLM agent
+// sendMessage sends a message to the LLM agent (non-streaming fallback)
 func (m Model) sendMessage(content string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
@@ -217,7 +392,7 @@ func (m Model) sendMessage(content string) tea.Cmd {
 			sessionID = sess.ID
 		}
 
-		// Run the agent
+		// Run the agent (non-streaming)
 		response, err := m.app.Agent.Run(ctx, sessionID, content)
 		if err != nil {
 			return responseMsg{err: err, sessionID: sessionID}

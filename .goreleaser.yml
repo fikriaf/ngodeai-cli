@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  NgodeAI CLI — GoReleaser Configuration
+#  Docs: https://goreleaser.com
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+
+# ── Build ────────────────────────────────────────────────────────────────────
+builds:
+  - id: ngodeai
+    main: .
+    binary: ngodeai
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/fikriaf/ngodeai-cli/cmd.version={{ .Version }}
+      - -X github.com/fikriaf/ngodeai-cli/cmd.commit={{ .Commit }}
+      - -X github.com/fikriaf/ngodeai-cli/cmd.date={{ .Date }}
+    # Per-OS overrides for CGO if needed in the future
+    overrides:
+      - goos: windows
+        goarch: arm64
+        env:
+          - CGO_ENABLED=0
+
+# ── Archives ─────────────────────────────────────────────────────────────────
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+      - install
+
+# ── Checksums ────────────────────────────────────────────────────────────────
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ── Release Notes ────────────────────────────────────────────────────────────
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: "🚀 Features"
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: "🐛 Bug Fixes"
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: "📖 Documentation"
+      regexp: '^.*?docs(\(.+\))??!?:.+$'
+      order: 2
+    - title: "🧹 Chores"
+      regexp: '^.*?chore(\(.+\))??!?:.+$'
+      order: 3
+    - title: "Other Changes"
+      order: 999
+  filters:
+    exclude:
+      - "^ci:"
+      - "^test:"
+      - "^style:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# ── GitHub Release ───────────────────────────────────────────────────────────
+release:
+  github:
+    owner: fikriaf
+    name: ngodeai-cli
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## NgodeAI CLI v{{ .Version }}
+
+    Terminal AI coding assistant built with Go.
+
+    ### Quick Install
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/fikriaf/ngodeai-cli/main/install | bash
+    ```
+
+    ### Downloads
+
+    | Platform | File |
+    |----------|------|
+    | Linux (amd64) | `ngodeai_{{ .Version }}_linux_amd64.tar.gz` |
+    | Linux (arm64) | `ngodeai_{{ .Version }}_linux_arm64.tar.gz` |
+    | macOS (amd64) | `ngodeai_{{ .Version }}_darwin_amd64.tar.gz` |
+    | macOS (arm64) | `ngodeai_{{ .Version }}_darwin_arm64.tar.gz` |
+    | Windows (amd64) | `ngodeai_{{ .Version }}_windows_amd64.zip` |
+    | Windows (arm64) | `ngodeai_{{ .Version }}_windows_arm64.zip` |
+
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/fikriaf/ngodeai-cli/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# ── Announce ─────────────────────────────────────────────────────────────────
+announce:
+  skip: "{{ if .Prerelease }}true{{ end }}"
+
+# ── Snapshots (local builds) ────────────────────────────────────────────────
+snapshot:
+  version_template: "{{ .Tag }}-next"

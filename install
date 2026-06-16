@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  NgodeAI CLI — Install Script
+#  Usage: curl -fsSL https://raw.githubusercontent.com/fikriaf/ngodeai-cli/main/install | bash
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Colors & Symbols ────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+info() { printf "${BLUE}▸${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${RESET} %s\n" "$*" >&2; }
+fail() { printf "${RED}✗${RESET} %s\n" "$*" >&2; exit 1; }
+
+# ── Banner ──────────────────────────────────────────────────────────────────
+printf "\n${CYAN}${BOLD}"
+printf "  ╔═══════════════════════════════════════════╗\n"
+printf "  ║        NgodeAI CLI — Installer            ║\n"
+printf "  ╚═══════════════════════════════════════════╝\n"
+printf "${RESET}\n"
+
+# ── Configuration ───────────────────────────────────────────────────────────
+GITHUB_REPO="fikriaf/ngodeai-cli"
+BINARY_NAME="ngodeai"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+
+# Allow override via environment variables
+VERSION="${NGODEAI_VERSION:-latest}"
+INSTALL_DIR="${NGODEAI_INSTALL_DIR:-}"
+
+# ── Detect OS ───────────────────────────────────────────────────────────────
+detect_os() {
+    local os
+    os="$(uname -s)"
+    case "${os}" in
+        Linux*)   echo "linux"   ;;
+        Darwin*)  echo "darwin"  ;;
+        MINGW*|MSYS*|CYGWIN*)  echo "windows" ;;
+        *)        fail "Unsupported operating system: ${os}" ;;
+    esac
+}
+
+# ── Detect Architecture ────────────────────────────────────────────────────
+detect_arch() {
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|amd64)    echo "amd64"  ;;
+        aarch64|arm64)   echo "arm64"  ;;
+        armv7l|armv6l)   echo "armv7"  ;;
+        *)               fail "Unsupported architecture: ${arch}" ;;
+    esac
+}
+
+# ── Detect Install Directory ───────────────────────────────────────────────
+detect_install_dir() {
+    if [ -n "${INSTALL_DIR}" ]; then
+        echo "${INSTALL_DIR}"
+        return
+    fi
+
+    # Prefer /usr/local/bin if writable, otherwise ~/.local/bin
+    if [ -w "/usr/local/bin" ] 2>/dev/null; then
+        echo "/usr/local/bin"
+    elif [ -w "${HOME}/.local/bin" ] 2>/dev/null || mkdir -p "${HOME}/.local/bin" 2>/dev/null; then
+        echo "${HOME}/.local/bin"
+    else
+        mkdir -p "${HOME}/.local/bin" 2>/dev/null || fail "Cannot create install directory"
+        echo "${HOME}/.local/bin"
+    fi
+}
+
+# ── Check Dependencies ─────────────────────────────────────────────────────
+check_deps() {
+    local missing=()
+
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        missing+=("curl or wget")
+    fi
+
+    if ! command -v tar &>/dev/null; then
+        missing+=("tar")
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        fail "Missing required tools: ${missing[*]}\n  Install them and try again."
+    fi
+}
+
+# ── Download Helper ────────────────────────────────────────────────────────
+download() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --progress-bar -o "${output}" "${url}"
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress -O "${output}" "${url}"
+    else
+        fail "No download tool available (need curl or wget)"
+    fi
+}
+
+# ── Fetch Latest Version ───────────────────────────────────────────────────
+fetch_latest_version() {
+    info "Fetching latest release info..."
+
+    local response
+    if command -v curl &>/dev/null; then
+        response=$(curl -fsSL "${GITHUB_API}" 2>/dev/null) || fail "Failed to fetch latest release. Check your internet connection."
+    else
+        response=$(wget -qO- "${GITHUB_API}" 2>/dev/null) || fail "Failed to fetch latest release. Check your internet connection."
+    fi
+
+    # Extract tag_name — pure bash, no jq dependency
+    local tag
+    tag=$(echo "${response}" | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+    if [ -z "${tag}" ]; then
+        fail "Could not determine latest version from GitHub"
+    fi
+
+    # Strip leading 'v' if present
+    echo "${tag#v}"
+}
+
+# ── Build Download URL ─────────────────────────────────────────────────────
+build_download_url() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+
+    local tag="v${version}"
+    local filename
+
+    case "${os}" in
+        windows) filename="${BINARY_NAME}_${version}_${os}_${arch}.zip" ;;
+        *)       filename="${BINARY_NAME}_${version}_${os}_${arch}.tar.gz" ;;
+    esac
+
+    echo "https://github.com/${GITHUB_REPO}/releases/download/${tag}/${filename}"
+}
+
+# ── Verify Install Dir in PATH ─────────────────────────────────────────────
+check_path() {
+    local dir="$1"
+    case ":${PATH}:" in
+        *":${dir}:"*) return 0 ;;
+        *)            return 1 ;;
+    esac
+}
+
+add_to_path_hint() {
+    local dir="$1"
+    local shell_name
+    shell_name="$(basename "${SHELL:-/bin/bash}")"
+
+    local rc_file
+    case "${shell_name}" in
+        zsh)  rc_file="~/.zshrc"   ;;
+        bash) rc_file="~/.bashrc"  ;;
+        fish) rc_file="~/.config/fish/config.fish" ;;
+        *)    rc_file="your shell config" ;;
+    esac
+
+    printf "\n"
+    warn "${dir} is not in your PATH."
+    printf "  Add it by running:\n\n"
+    if [ "${shell_name}" = "fish" ]; then
+        printf "    ${CYAN}fish_add_path ${dir}${RESET}\n"
+    else
+        printf "    ${CYAN}echo 'export PATH=\"\$PATH:${dir}\"' >> ${rc_file}${RESET}\n"
+        printf "    ${CYAN}source ${rc_file}${RESET}\n"
+    fi
+    printf "\n"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────
+main() {
+    # Step 1: Detect environment
+    info "Detecting environment..."
+    local os arch install_dir
+    os="$(detect_os)"
+    arch="$(detect_arch)"
+    install_dir="$(detect_install_dir)"
+
+    ok "Platform: ${BOLD}${os}/${arch}${RESET}"
+
+    # Step 2: Check dependencies
+    check_deps
+    ok "Dependencies satisfied"
+
+    # Step 3: Determine version
+    local version
+    if [ "${VERSION}" = "latest" ]; then
+        version="$(fetch_latest_version)"
+    else
+        version="${VERSION}"
+    fi
+    ok "Version: ${BOLD}v${version}${RESET}"
+
+    # Step 4: Build download URL
+    local url filename
+    url="$(build_download_url "${version}" "${os}" "${arch}")"
+    filename="$(basename "${url}")"
+
+    info "Downloading ${DIM}${filename}${RESET}"
+
+    # Step 5: Download to temp directory
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' EXIT
+
+    local download_path="${tmp_dir}/${filename}"
+    download "${url}" "${download_path}"
+    ok "Download complete"
+
+    # Step 6: Extract
+    info "Extracting..."
+    case "${filename}" in
+        *.tar.gz|*.tgz)
+            tar -xzf "${download_path}" -C "${tmp_dir}"
+            ;;
+        *.zip)
+            unzip -qo "${download_path}" -d "${tmp_dir}"
+            ;;
+        *)
+            fail "Unknown archive format: ${filename}"
+            ;;
+    esac
+    ok "Extraction complete"
+
+    # Step 7: Find the binary
+    local binary_path
+    binary_path="$(find "${tmp_dir}" -name "${BINARY_NAME}" -type f | head -1)"
+    if [ -z "${binary_path}" ]; then
+        # Maybe it's the only executable in the archive
+        binary_path="$(find "${tmp_dir}" -type f -perm +111 | head -1)"
+    fi
+    if [ -z "${binary_path}" ]; then
+        fail "Binary '${BINARY_NAME}' not found in archive"
+    fi
+
+    # Step 8: Install
+    mkdir -p "${install_dir}"
+    chmod +x "${binary_path}"
+
+    local target="${install_dir}/${BINARY_NAME}"
+
+    # Handle potential permission issues gracefully
+    if ! cp "${binary_path}" "${target}" 2>/dev/null; then
+        info "Trying with sudo..."
+        if command -v sudo &>/dev/null; then
+            sudo cp "${binary_path}" "${target}"
+            sudo chmod +x "${target}"
+        else
+            fail "Permission denied installing to ${install_dir}. Try: NGODEAI_INSTALL_DIR=~/.local/bin bash install"
+        fi
+    fi
+    chmod +x "${target}" 2>/dev/null || true
+
+    ok "Installed to ${BOLD}${target}${RESET}"
+
+    # Step 9: Verify
+    if "${target}" --version 2>/dev/null; then
+        : # version output is fine
+    else
+        warn "Could not verify installation (binary may still work)"
+    fi
+
+    # Step 10: PATH check
+    if ! check_path "${install_dir}"; then
+        add_to_path_hint "${install_dir}"
+    fi
+
+    # Success!
+    printf "\n${GREEN}${BOLD}"
+    printf "  ╔═══════════════════════════════════════════╗\n"
+    printf "  ║     ✓ NgodeAI CLI installed successfully! ║\n"
+    printf "  ╚═══════════════════════════════════════════╝\n"
+    printf "${RESET}\n"
+    printf "  ${DIM}Run '${BOLD}${BINARY_NAME}${DIM}' to get started.${RESET}\n"
+    printf "  ${DIM}Docs: https://github.com/${GITHUB_REPO}${RESET}\n\n"
+}
+
+main "$@"
