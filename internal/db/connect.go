@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	_ "github.com/ncruces/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/pressly/goose/v3"
 )
 
@@ -25,8 +25,8 @@ func Connect(dataDir string) (*Connection, error) {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	// Open database
-	db, err := sql.Open("sqlite3", dbPath)
+	// Open database with correct driver name for modernc.org/sqlite
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -56,49 +56,49 @@ func Connect(dataDir string) (*Connection, error) {
 }
 
 func runMigrations(db *sql.DB) error {
-	// For now, create tables directly
-	// In production, use goose with embedded SQL files
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS sessions (
-			id TEXT PRIMARY KEY,
-			parent_session_id TEXT REFERENCES sessions(id),
-			title TEXT NOT NULL DEFAULT 'New Session',
-			summary_message_id TEXT,
-			message_count INTEGER DEFAULT 0,
-			prompt_tokens INTEGER DEFAULT 0,
-			completion_tokens INTEGER DEFAULT 0,
-			cost REAL DEFAULT 0,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		);
+	sessions := "CREATE TABLE IF NOT EXISTS sessions (" +
+		"id TEXT PRIMARY KEY," +
+		"parent_session_id TEXT," +
+		"title TEXT NOT NULL DEFAULT 'New Session'," +
+		"summary_message_id TEXT," +
+		"message_count INTEGER DEFAULT 0," +
+		"prompt_tokens INTEGER DEFAULT 0," +
+		"completion_tokens INTEGER DEFAULT 0," +
+		"cost REAL DEFAULT 0," +
+		"created_at INTEGER NOT NULL," +
+		"updated_at INTEGER NOT NULL" +
+		")"
 
-		CREATE TABLE IF NOT EXISTS messages (
-			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-			role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool', 'system')),
-			parts TEXT NOT NULL,
-			model TEXT,
-			finished_at INTEGER,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		);
+	messages := "CREATE TABLE IF NOT EXISTS messages (" +
+		"id TEXT PRIMARY KEY," +
+		"session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE," +
+		"role TEXT NOT NULL," +
+		"parts TEXT NOT NULL," +
+		"model TEXT," +
+		"finished_at INTEGER," +
+		"created_at INTEGER NOT NULL," +
+		"updated_at INTEGER NOT NULL" +
+		")"
 
-		CREATE TABLE IF NOT EXISTS files (
-			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-			path TEXT NOT NULL,
-			content TEXT NOT NULL,
-			version TEXT NOT NULL,
-			UNIQUE(path, session_id, version),
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		);
+	files := "CREATE TABLE IF NOT EXISTS files (" +
+		"id TEXT PRIMARY KEY," +
+		"session_id TEXT NOT NULL," +
+		"path TEXT NOT NULL," +
+		"content TEXT NOT NULL," +
+		"version TEXT NOT NULL," +
+		"created_at INTEGER NOT NULL," +
+		"updated_at INTEGER NOT NULL" +
+		")"
 
-		CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
-		CREATE INDEX IF NOT EXISTS idx_files_session_id ON files(session_id);
-	`)
+	tables := []string{sessions, messages, files}
 
-	return err
+	for _, table := range tables {
+		if _, err := db.Exec(table); err != nil {
+			return fmt.Errorf("migration error: %w (SQL: %.50s...)", err, table)
+		}
+	}
+
+	return nil
 }
 
 // Close closes the database connection
