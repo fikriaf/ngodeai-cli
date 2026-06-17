@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fikriaf/ngodeai-cli/internal/app"
 	"github.com/fikriaf/ngodeai-cli/internal/config"
 	"github.com/fikriaf/ngodeai-cli/internal/db"
 	"github.com/fikriaf/ngodeai-cli/internal/logging"
+	"github.com/fikriaf/ngodeai-cli/internal/setup"
 	"github.com/fikriaf/ngodeai-cli/internal/tui"
 	"github.com/spf13/cobra"
 )
@@ -41,6 +43,18 @@ func init() {
 	rootCmd.Flags().StringVarP(&prompt, "prompt", "p", "", "Non-interactive prompt")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	rootCmd.Flags().BoolP("version", "v", false, "Print version")
+
+	// Add setup subcommand
+	setupCmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Run interactive setup wizard",
+		Long:  "Configure your AI provider (Anthropic, OpenAI, Gemini, or custom endpoint)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := setup.RunWizard()
+			return err
+		},
+	}
+	rootCmd.AddCommand(setupCmd)
 }
 
 func Execute() {
@@ -87,21 +101,46 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer a.Close()
 
-	// Check if provider is configured
+	// Check if provider is configured - if not, run setup wizard
 	if a.Agent == nil {
 		fmt.Println("⚠️  No LLM provider configured!")
-		fmt.Println("")
-		fmt.Println("Set an API key via environment variables:")
-		fmt.Println("  export OPENAI_API_KEY=sk-...")
-		fmt.Println("  export ANTHROPIC_API_KEY=sk-ant-...")
-		fmt.Println("")
-		fmt.Println("Or create a .ngode.json config file:")
-		fmt.Println(`  {
-    "providers": {
-      "openai": { "apiKey": "sk-..." }
-    }
-  }`)
-		return nil
+		fmt.Println()
+		fmt.Print("Run setup wizard? (Y/n): ")
+		
+		var response string
+		fmt.Scanln(&response)
+		response = strings.ToLower(strings.TrimSpace(response))
+		
+		if response == "n" || response == "no" {
+			fmt.Println("Setup cancelled. You can run 'ngodeai setup' later.")
+			return nil
+		}
+		
+		// Run interactive setup wizard
+		_, err = setup.RunWizard()
+		if err != nil {
+			return fmt.Errorf("setup failed: %w", err)
+		}
+		
+		// Reload configuration after setup
+		cfg, err = config.Load(absCwd, debug)
+		if err != nil {
+			return fmt.Errorf("failed to reload config: %w", err)
+		}
+		
+		// Recreate app with new config
+		a, err = app.New(ctx, conn, cfg)
+		if err != nil {
+			return fmt.Errorf("failed to create app: %w", err)
+		}
+		defer a.Close()
+		
+		if a.Agent == nil {
+			return fmt.Errorf("setup completed but provider still not configured")
+		}
+		
+		fmt.Println("✅ Setup complete! Starting NgodeAI...")
+		fmt.Println()
 	}
 
 	// Non-interactive mode
