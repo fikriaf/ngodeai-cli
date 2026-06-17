@@ -14,6 +14,7 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/markdown"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/slash"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/sidebar"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/statusbar"
@@ -56,6 +57,9 @@ type Model struct {
 	// Theme
 	currentTheme string
 
+	// Markdown renderer
+	mdRenderer *markdown.Renderer
+
 	// Slash command registry
 	slashRegistry *slash.Registry
 
@@ -90,6 +94,9 @@ func New(a *app.App) Model {
 
 	vp := viewport.New(80, 20)
 
+	// Initialize markdown renderer
+	mdRenderer, _ := markdown.NewRenderer("default")
+
 	return Model{
 		app:           a,
 		textarea:      ta,
@@ -99,6 +106,7 @@ func New(a *app.App) Model {
 		},
 		currentTheme:  "default",
 		slashRegistry: slash.NewRegistry(),
+		mdRenderer:    mdRenderer,
 	}
 }
 
@@ -704,7 +712,15 @@ func (m Model) renderMessages() string {
 			if m.streaming && i == len(m.messages)-1 {
 				content += sCursor
 			}
-			b.WriteString(contentStyle.Render(content))
+			// Render markdown with glamour (syntax highlighted code blocks)
+			rendered, err := m.mdRenderer.Render(content)
+			if err != nil {
+				// Fallback to plain text if rendering fails
+				rendered = contentStyle.Render(content)
+			} else {
+				rendered = contentStyle.Render(rendered)
+			}
+			b.WriteString(rendered)
 		case "system":
 			b.WriteString(systemMsgStyle.Render(msg.Content))
 		}
