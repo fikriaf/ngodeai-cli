@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fikriaf/ngodeai-cli/internal/app"
+	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/slash"
@@ -42,10 +43,9 @@ type Model struct {
 	sessionID string
 	err       error
 
-	// Streaming state
-	streaming       bool
-	streamContentCh <-chan string
-	streamErrCh     <-chan error
+	// Streaming state (rich events from agent)
+	streaming     bool
+	agentEventCh  <-chan agent.AgentEvent
 
 	// Dialog state
 	activeDialog  activeDialog
@@ -60,11 +60,14 @@ type Model struct {
 	slashRegistry *slash.Registry
 
 	// UI state
-	showSidebar    bool      // Toggle sidebar visibility (ctrl+b)
-	startTime      time.Time // When streaming/thinking started
-	responseTime   time.Duration // Last response time
-	promptTokens   int64
+	showSidebar      bool        // Toggle sidebar visibility (ctrl+b)
+	startTime        time.Time   // When streaming/thinking started
+	responseTime     time.Duration // Last response time
+	promptTokens     int64
 	completionTokens int64
+	currentIteration int         // Current agent iteration (tool loop count)
+	currentTool      string      // Currently executing tool name
+	toolResults      int         // Number of tool results in current session
 }
 
 // ChatMessage represents a displayed message
@@ -296,51 +299,112 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	// ── Streaming messages ────────────────────────────────────────
-	case streamSetupMsg:
+	// ── Streaming messages (rich events) ──────────────────────────
+	case agentSetupMsg:
 		if msg.err != nil {
 			m.streaming = false
 			return m, m.sendMessage(msg.content)
 		}
 		m.sessionID = msg.sessionID
-		m.streamContentCh = msg.contentCh
-		m.streamErrCh = msg.errCh
-		m.startTime = time.Now() // Record start time for response tracking
+		m.agentEventCh = msg.eventCh
+		m.startTime = time.Now()
 		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: ""})
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
-		return m, m.waitForStreamChunk()
+		return m, m.waitForAgentEvent()
 
-	case streamChunkMsg:
-		if len(m.messages) > 0 {
-			last := &m.messages[len(m.messages)-1]
-			if last.Role == "assistant" {
-				last.Content += string(msg)
+	case agentEventMsg:
+		event := agent.AgentEvent(msg)
+
+		switch event.Type {
+		case agent.EventContentDelta:
+			// Append streamed text to the last assistant message
+			if len(m.messages) > 0 {
+				last := &m.messages[len(m.messages)-1]
+				if last.Role == "assistant" {
+					last.Content += event.Content
+				}
+			}
+
+		case agent.EventToolStart:
+			m.currentTool = event.ToolName
+			// Show tool execution in chat
+			if len(m.messages) > 0 {
+				last := &m.messages[len(m.messages)-1]
+				if last.Role == "assistant" {
+					last.Content += fmt.Sprintf("\n⚡ Running: %s\n", event.ToolName)
+				}
+			}
+
+		case agent.EventToolEnd:
+			// Tool finished parsing (not yet executed)
+			m.currentTool = ""
+
+		case agent.EventToolResult:
+			m.toolResults++
+			m.currentTool = ""
+			// Show abbreviated tool result
+			resultPreview := event.ToolResult
+			if len(resultPreview) > 200 {
+				resultPreview = resultPreview[:200] + "..."
+			}
+			status := "✓"
+			if event.ToolError {
+				status = "✗"
+			}
+			if len(m.messages) > 0 {
+				last := &m.messages[len(m.messages)-1]
+				if last.Role == "assistant" {
+					last.Content += fmt.Sprintf("  %s Result: %s\n\n", status, resultPreview)
+				}
+			}
+
+		case agent.EventTokens:
+			// Update token tracking from API response
+			m.promptTokens = event.PromptTokens
+			m.completionTokens = event.CompletionTokens
+
+		case agent.EventIteration:
+			m.currentIteration = event.Iteration
+
+		case agent.EventDone:
+			m.streaming = false
+			m.loading = false
+			m.agentEventCh = nil
+			m.promptTokens = event.PromptTokens
+			m.completionTokens = event.CompletionTokens
+			m.currentIteration = event.Iteration
+			if !m.startTime.IsZero() {
+				m.responseTime = time.Since(m.startTime)
+				m.startTime = time.Time{}
+			}
+
+		case agent.EventError:
+			m.streaming = false
+			m.loading = false
+			m.agentEventCh = nil
+			m.currentTool = ""
+			if !m.startTime.IsZero() {
+				m.responseTime = time.Since(m.startTime)
+				m.startTime = time.Time{}
+			}
+			if event.Error != nil {
+				errText := fmt.Sprintf("\n\n⚠ Error: %v", event.Error)
+				if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == "assistant" {
+					m.messages[len(m.messages)-1].Content += errText
+				} else {
+					m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: fmt.Sprintf("Error: %v", event.Error)})
+				}
 			}
 		}
-		m.viewport.SetContent(m.renderMessages())
-		m.viewport.GotoBottom()
-		return m, m.waitForStreamChunk()
 
-	case streamDoneMsg:
-		m.streaming = false
-		m.loading = false
-		m.streamContentCh = nil
-		m.streamErrCh = nil
-		if !m.startTime.IsZero() {
-			m.responseTime = time.Since(m.startTime)
-			m.startTime = time.Time{}
-		}
-		if msg.err != nil {
-			errText := fmt.Sprintf("\n\n⚠ Error: %v", msg.err)
-			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == "assistant" {
-				m.messages[len(m.messages)-1].Content += errText
-			} else {
-				m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: fmt.Sprintf("Error: %v", msg.err)})
-			}
-		}
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
+
+		// Continue listening if still streaming
+		if m.streaming {
+			return m, m.waitForAgentEvent()
+		}
 		return m, nil
 
 	// ── Non-streaming fallback ────────────────────────────────────
@@ -668,23 +732,16 @@ func truncate(s string, maxLen int) string {
 
 // ── Streaming tea.Msg types ──────────────────────────────────────────────────
 
-// streamSetupMsg is sent once the streaming goroutine has created the session
-// and obtained the content/error channels from the agent.
-type streamSetupMsg struct {
-	contentCh <-chan string
-	errCh     <-chan error
+// agentSetupMsg is sent once the agent has started and the event channel is ready
+type agentSetupMsg struct {
+	eventCh   <-chan agent.AgentEvent
 	sessionID string
 	content   string
 	err       error
 }
 
-// streamChunkMsg carries a single content delta from the streaming response.
-type streamChunkMsg string
-
-// streamDoneMsg signals that the stream has finished.
-type streamDoneMsg struct {
-	err error
-}
+// agentEventMsg wraps an agent event for the tea event loop
+type agentEventMsg agent.AgentEvent
 
 // ── Streaming commands ───────────────────────────────────────────────────────
 
@@ -696,62 +753,35 @@ func (m Model) startStreaming(content string) tea.Cmd {
 		if sessionID == "" {
 			sess, err := m.app.Sessions.Create("TUI Session")
 			if err != nil {
-				return streamSetupMsg{content: content, err: err}
+				return agentSetupMsg{content: content, err: err}
 			}
 			sessionID = sess.ID
 		}
 
-		contentCh, errCh := m.app.Agent.StreamRun(ctx, sessionID, content)
-		return streamSetupMsg{
-			contentCh: contentCh,
-			errCh:     errCh,
+		eventCh := m.app.Agent.StreamRunEvents(ctx, sessionID, content)
+		return agentSetupMsg{
+			eventCh:   eventCh,
 			sessionID: sessionID,
 			content:   content,
 		}
 	}
 }
 
-func (m Model) waitForStreamChunk() tea.Cmd {
-	contentCh := m.streamContentCh
-	errCh := m.streamErrCh
-	if contentCh == nil && errCh == nil {
+func (m Model) waitForAgentEvent() tea.Cmd {
+	eventCh := m.agentEventCh
+	if eventCh == nil {
 		return nil
 	}
 
 	return func() tea.Msg {
-		if contentCh != nil {
-			select {
-			case chunk, ok := <-contentCh:
-				if !ok {
-					if errCh != nil {
-						if err, ok := <-errCh; ok && err != nil {
-							return streamDoneMsg{err: err}
-						}
-					}
-					return streamDoneMsg{}
-				}
-				return streamChunkMsg(chunk)
-			default:
-			}
-		}
-
 		select {
-		case chunk, ok := <-contentCh:
+		case event, ok := <-eventCh:
 			if !ok {
-				if errCh != nil {
-					if err, ok := <-errCh; ok && err != nil {
-						return streamDoneMsg{err: err}
-					}
-				}
-				return streamDoneMsg{}
+				return nil // Channel closed, streaming done
 			}
-			return streamChunkMsg(chunk)
-
-		case err, ok := <-errCh:
-			if !ok {
-				return streamDoneMsg{}
-			}
-			return streamDoneMsg{err: err}
+			return agentEventMsg(event)
+		default:
+			return nil
 		}
 	}
 }

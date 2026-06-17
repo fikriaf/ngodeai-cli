@@ -109,9 +109,11 @@ func Render(data Data, themeName string) string {
 		truncate(data.ProviderName, 15))
 	
 	if data.MaxTokens > 0 && data.ContextWindow > 0 {
+		tokensK := float64(data.Tokens) / 1000
+		contextK := float64(data.ContextWindow) / 1000
 		pct := float64(data.Tokens) / float64(data.ContextWindow) * 100
-		barWidth := 20
-		filled := int(float64(pct) / 100.0 * float64(barWidth))
+		barWidth := 15
+		filled := int(pct / 100.0 * float64(barWidth))
 		if filled < 0 {
 			filled = 0
 		}
@@ -119,19 +121,11 @@ func Render(data Data, themeName string) string {
 			filled = barWidth
 		}
 		
-		progressBar := lipgloss.NewStyle().
-			Background(lipgloss.Color("#FF6600")).
-			Render(strings.Repeat("█", filled))
+		filledBar := strings.Repeat("█", filled)
+		emptyBar := strings.Repeat("░", barWidth-filled)
 		
-		emptyBar := lipgloss.NewStyle().
-			Foreground(t.TextMuted).
-			Render(strings.Repeat("░", barWidth-filled))
-		
-		sectionBody += fmt.Sprintf("  Context: %.0fK/%dK (%s%s)\n", 
-			float64(data.Tokens)/1000,
-			float64(data.ContextWindow)/1000,
-			progressBar,
-			emptyBar)
+		sectionBody += fmt.Sprintf("  Context: %.1fK/%.0fK (%.0f%%)\n", tokensK, contextK, pct)
+		sectionBody += fmt.Sprintf("  [%s%s]\n", filledBar, emptyBar)
 		sectionBody += fmt.Sprintf("  Max output: %d tokens\n", data.MaxTokens)
 	}
 	

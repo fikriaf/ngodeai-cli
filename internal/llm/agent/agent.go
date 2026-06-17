@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/tools"
@@ -346,6 +347,213 @@ func (a *Agent) StreamRun(ctx context.Context, sessionID string, userContent str
 	}()
 
 	return contentCh, errCh
+}
+
+// StreamRunEvents executes the full agent loop returning rich AgentEvents
+// with token tracking, tool execution details, timing, and iteration info.
+func (a *Agent) StreamRunEvents(ctx context.Context, sessionID string, userContent string) <-chan AgentEvent {
+	eventCh := make(chan AgentEvent, 200)
+
+	go func() {
+		defer close(eventCh)
+
+		startTime := time.Now()
+		tracker := &TokenTracker{}
+
+		// ── Persist user message ──────────────────────────────────
+		_, err := a.messages.Create(sessionID, "user", []message.ContentPart{
+			message.TextContent{Text: userContent},
+		})
+		if err != nil {
+			eventCh <- AgentEvent{Type: EventError, Error: fmt.Errorf("failed to create user message: %w", err)}
+			return
+		}
+
+		// ── Build in-memory conversation ──────────────────────────
+		if _, err := a.CompactIfNeeded(ctx, sessionID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: compaction check failed: %v\n", err)
+		}
+
+		dbMessages, err := a.GetCompactedMessages(sessionID)
+		if err != nil {
+			eventCh <- AgentEvent{Type: EventError, Error: fmt.Errorf("failed to list messages: %w", err)}
+			return
+		}
+		conversation := make([]message.Message, len(dbMessages))
+		copy(conversation, dbMessages)
+
+		providerTools := a.buildProviderTools()
+
+		// ── Agent loop ────────────────────────────────────────────
+		for iteration := 0; iteration < maxAgentIterations; iteration++ {
+			tracker.Iterations = iteration + 1
+
+			// Notify iteration start
+			eventCh <- AgentEvent{
+				Type:      EventIteration,
+				Iteration: iteration + 1,
+			}
+
+			// Stream one turn from the provider
+			providerEventCh := a.provider.StreamResponse(ctx, conversation, providerTools)
+
+			var fullContent strings.Builder
+			var toolCalls []message.ToolCall
+
+			for event := range providerEventCh {
+				switch event.Type {
+				case provider.EventContentDelta:
+					fullContent.WriteString(event.Content)
+					eventCh <- AgentEvent{
+						Type:    EventContentDelta,
+						Content: event.Content,
+					}
+
+				case provider.EventToolUseStart:
+					if event.ToolCall != nil {
+						eventCh <- AgentEvent{
+							Type:     EventToolStart,
+							ToolCall: event.ToolCall,
+							ToolName: event.ToolCall.Name,
+						}
+					}
+
+				case provider.EventToolUseStop:
+					if event.ToolCall != nil {
+						toolCalls = append(toolCalls, *event.ToolCall)
+						eventCh <- AgentEvent{
+							Type:     EventToolEnd,
+							ToolCall: event.ToolCall,
+							ToolName: event.ToolCall.Name,
+						}
+					}
+
+				case provider.EventComplete:
+					// Track token usage from provider
+					if event.TokenUsage != nil {
+						tracker.Add(event.TokenUsage)
+						eventCh <- AgentEvent{
+							Type:             EventTokens,
+							PromptTokens:     tracker.PromptTokens,
+							CompletionTokens: tracker.CompletionTokens,
+						}
+					}
+
+				case provider.EventError:
+					eventCh <- AgentEvent{
+						Type:         EventError,
+						Error:        event.Error,
+						ResponseTime: time.Since(startTime).Seconds(),
+					}
+					return
+				}
+			}
+
+			// ── Persist assistant message ─────────────────────────
+			if fullContent.Len() > 0 || len(toolCalls) > 0 {
+				parts := make([]message.ContentPart, 0, 1+len(toolCalls))
+				if fullContent.Len() > 0 {
+					parts = append(parts, message.TextContent{Text: fullContent.String()})
+				}
+				for _, tc := range toolCalls {
+					parts = append(parts, tc)
+				}
+				if _, err := a.messages.Create(sessionID, "assistant", parts); err != nil {
+					eventCh <- AgentEvent{Type: EventError, Error: fmt.Errorf("failed to save assistant message: %w", err)}
+					return
+				}
+			}
+
+			// ── No tool calls → final response ───────────────────
+			if len(toolCalls) == 0 {
+				eventCh <- AgentEvent{
+					Type:             EventDone,
+					PromptTokens:     tracker.PromptTokens,
+					CompletionTokens: tracker.CompletionTokens,
+					Iteration:        tracker.Iterations,
+					ResponseTime:     time.Since(startTime).Seconds(),
+				}
+				return
+			}
+
+			// ── Build in-memory assistant message with tool calls ─
+			assistantParts := make([]message.ContentPart, 0, 1+len(toolCalls))
+			if fullContent.Len() > 0 {
+				assistantParts = append(assistantParts, message.TextContent{Text: fullContent.String()})
+			}
+			for _, tc := range toolCalls {
+				assistantParts = append(assistantParts, tc)
+			}
+			conversation = append(conversation, message.Message{
+				Role:  "assistant",
+				Parts: assistantParts,
+			})
+
+			// ── Execute each tool ─────────────────────────────────
+			for _, tc := range toolCalls {
+				var resultContent string
+				var isError bool
+
+				tool, ok := a.tools[tc.Name]
+				if !ok {
+					resultContent = fmt.Sprintf("unknown tool: %s", tc.Name)
+					isError = true
+				} else {
+					result, runErr := tool.Run(ctx, tools.ToolCall{
+						CallID: tc.ID,
+						Name:   tc.Name,
+						Args:   tc.Args,
+					})
+					if runErr != nil {
+						resultContent = fmt.Sprintf("Error: %v", runErr)
+						isError = true
+					} else {
+						resultContent = result.Content
+						isError = result.IsError
+					}
+				}
+
+				// Send tool result event
+				eventCh <- AgentEvent{
+					Type:       EventToolResult,
+					ToolCall:   &tc,
+					ToolName:   tc.Name,
+					ToolResult: resultContent,
+					ToolError:  isError,
+				}
+
+				// Persist tool result
+				a.messages.Create(sessionID, "tool", []message.ContentPart{
+					message.ToolResult{
+						ToolCallID: tc.ID,
+						Content:    resultContent,
+						IsError:    isError,
+					},
+				})
+
+				// Add tool result to in-memory conversation
+				conversation = append(conversation, message.Message{
+					Role: "tool",
+					Parts: []message.ContentPart{
+						message.ToolResult{
+							ToolCallID: tc.ID,
+							Content:    resultContent,
+							IsError:    isError,
+						},
+					},
+				})
+			}
+		}
+
+		// Hit the iteration cap
+		eventCh <- AgentEvent{
+			Type:         EventError,
+			Error:        fmt.Errorf("agent loop exceeded maximum iterations (%d)", maxAgentIterations),
+			ResponseTime: time.Since(startTime).Seconds(),
+		}
+	}()
+
+	return eventCh
 }
 
 // Provider returns the current provider
