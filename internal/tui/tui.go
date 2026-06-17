@@ -19,6 +19,7 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/tui/sidebar"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/statusbar"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/theme"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/toolcontainer"
 )
 
 // activeDialog tracks which dialog overlay (if any) is currently shown.
@@ -72,6 +73,8 @@ type Model struct {
 	currentIteration int         // Current agent iteration (tool loop count)
 	currentTool      string      // Currently executing tool name
 	toolResults      int         // Number of tool results in current session
+	toolExecutions   map[string]*toolcontainer.ToolExecution // Track tool executions by ID
+	toolStartTime    time.Time   // When current tool started
 }
 
 // ChatMessage represents a displayed message
@@ -98,15 +101,16 @@ func New(a *app.App) Model {
 	mdRenderer, _ := markdown.NewRenderer("default")
 
 	return Model{
-		app:           a,
-		textarea:      ta,
-		viewport:      vp,
+		app:              a,
+		textarea:         ta,
+		viewport:         vp,
 		messages: []ChatMessage{
 			{Role: "system", Content: "Welcome to NgodeAI CLI! Type your question or /help for commands."},
 		},
-		currentTheme:  "default",
-		slashRegistry: slash.NewRegistry(),
-		mdRenderer:    mdRenderer,
+		currentTheme:     "default",
+		slashRegistry:    slash.NewRegistry(),
+		mdRenderer:       mdRenderer,
+		toolExecutions:   make(map[string]*toolcontainer.ToolExecution),
 	}
 }
 
@@ -336,6 +340,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case agent.EventToolStart:
 			m.currentTool = event.ToolName
+			m.toolStartTime = time.Now()
+			// Track tool execution
+			toolID := fmt.Sprintf("%s_%d", event.ToolName, time.Now().UnixNano())
+			var toolArgs map[string]interface{}
+			if event.ToolCall != nil {
+				toolID = event.ToolCall.ID
+				toolArgs = event.ToolCall.Args
+			}
+			m.toolExecutions[toolID] = &toolcontainer.ToolExecution{
+				Name:       event.ToolName,
+				Parameters: toolArgs,
+				Timestamp:  time.Now(),
+			}
 			// Show tool execution in chat
 			if len(m.messages) > 0 {
 				last := &m.messages[len(m.messages)-1]
@@ -351,6 +368,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.EventToolResult:
 			m.toolResults++
 			m.currentTool = ""
+			duration := time.Since(m.toolStartTime)
+			// Update tool execution with result
+			toolID := fmt.Sprintf("%s_%d", event.ToolName, m.toolStartTime.UnixNano())
+			if event.ToolCall != nil {
+				toolID = event.ToolCall.ID
+			}
+			if exec, exists := m.toolExecutions[toolID]; exists {
+				exec.Output = event.ToolResult
+				exec.Error = event.ToolError
+				exec.Duration = duration
+			}
 			// Show abbreviated tool result
 			resultPreview := event.ToolResult
 			if len(resultPreview) > 200 {
@@ -721,6 +749,16 @@ func (m Model) renderMessages() string {
 				rendered = contentStyle.Render(rendered)
 			}
 			b.WriteString(rendered)
+			
+			// Render tool execution containers for this message
+			for _, exec := range m.toolExecutions {
+				// Only render completed tool executions
+				if exec.Duration > 0 {
+					container := toolcontainer.Render(*exec, m.currentTheme, m.width-4)
+					b.WriteString("\n")
+					b.WriteString(contentStyle.Render(container))
+				}
+			}
 		case "system":
 			b.WriteString(systemMsgStyle.Render(msg.Content))
 		}
