@@ -12,6 +12,7 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/app"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/slash"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/theme"
 )
 
@@ -51,6 +52,9 @@ type Model struct {
 
 	// Theme
 	currentTheme string
+
+	// Slash command registry
+	slashRegistry *slash.Registry
 }
 
 // ChatMessage represents a displayed message
@@ -62,7 +66,7 @@ type ChatMessage struct {
 // New creates a new TUI model
 func New(a *app.App) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Ask anything... (Ctrl+O: model · Ctrl+T: theme · Ctrl+F: file · Ctrl+C: quit)"
+	ta.Placeholder = "Ask anything... Type / for commands (Ctrl+O: model · Ctrl+T: theme · Ctrl+C: quit)"
 	ta.Focus()
 	ta.Prompt = "\u2503 "
 	ta.CharLimit = 4096
@@ -74,13 +78,14 @@ func New(a *app.App) Model {
 	vp := viewport.New(80, 20)
 
 	return Model{
-		app:      a,
-		textarea: ta,
-		viewport: vp,
+		app:           a,
+		textarea:      ta,
+		viewport:      vp,
 		messages: []ChatMessage{
-			{Role: "system", Content: "Welcome to NgodeAI CLI! Type your question and press Enter."},
+			{Role: "system", Content: "Welcome to NgodeAI CLI! Type your question or /help for commands."},
 		},
-		currentTheme: "default",
+		currentTheme:  "default",
+		slashRegistry: slash.NewRegistry(),
 	}
 }
 
@@ -211,6 +216,58 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.textarea.Value() != "" && !m.loading {
 				content := m.textarea.Value()
 				m.textarea.Reset()
+
+				// Check for slash commands first
+				if cmd, args := m.slashRegistry.Parse(content); cmd != nil {
+					output, action := cmd.Handler(args)
+					
+					// Add command to chat history
+					m.messages = append(m.messages, ChatMessage{Role: "user", Content: content})
+					
+					// Execute action based on type
+					switch action {
+					case slash.ActionQuit:
+						return m, tea.Quit
+					case slash.ActionClearChat:
+						m.messages = []ChatMessage{}
+					case slash.ActionOpenModel:
+						m.activeDialog = modelDialog
+						models := m.buildModelItems()
+						m.modelSelector = dialog.NewModelSelector(models)
+						m.modelSelector.SetSize(m.width, m.height)
+						return m, m.modelSelector.Init()
+					case slash.ActionOpenTheme:
+						m.activeDialog = themeDialog
+						themes := m.buildThemeItems()
+						m.themePicker = dialog.NewThemePicker(themes, m.currentTheme)
+						return m, m.themePicker.Init()
+					case slash.ActionOpenSession:
+						// TODO: Implement session dialog
+						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "Session dialog not yet implemented"})
+					case slash.ActionNewSession:
+						// TODO: Implement new session
+						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "New session feature coming soon!"})
+					case slash.ActionCompact:
+						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "🗜️ Session compaction coming soon!"})
+					case slash.ActionShowConfig:
+						if m.app.Config != nil {
+							configStr := fmt.Sprintf("📋 **Current Config:**\n```\nWorkingDir: %s\nDataDir: %s\nDebug: %v\nProviders: %d configured\n```", 
+								m.app.Config.WorkingDir, m.app.Config.DataDir, m.app.Config.Debug, len(m.app.Config.Providers))
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: configStr})
+						}
+					default:
+						// ActionNone or ActionOpenHelp - just show output
+						if output != "" {
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: output})
+						}
+					}
+					
+					m.viewport.SetContent(m.renderMessages())
+					m.viewport.GotoBottom()
+					return m, nil
+				}
+
+				// Regular message - send to agent
 				m.messages = append(m.messages, ChatMessage{Role: "user", Content: content})
 				m.loading = true
 				m.viewport.GotoBottom()

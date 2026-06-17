@@ -78,14 +78,14 @@ func New(ctx context.Context, conn *db.Connection, cfg *config.Config) (*App, er
 	}
 
 	// Check for custom provider first, then Anthropic, OpenAI, Gemini
-	if cfg.Providers["custom"].APIKey != "" {
-		p = provider.NewOpenAIWithBaseURL(cfg.Providers["custom"].APIKey, cfg.Providers["custom"].Model, cfg.Providers["custom"].BaseURL)
-	} else if cfg.Providers["anthropic"].APIKey != "" {
-		p = provider.NewAnthropic(cfg.Providers["anthropic"].APIKey, cfg.Providers["anthropic"].Model)
-	} else if cfg.Providers["openai"].APIKey != "" {
-		p = provider.NewOpenAI(cfg.Providers["openai"].APIKey, cfg.Providers["openai"].Model)
-	} else if cfg.Providers["gemini"].APIKey != "" {
-		p = provider.NewGemini(cfg.Providers["gemini"].APIKey, cfg.Providers["gemini"].Model)
+	if cp, ok := cfg.Providers["custom"]; ok && cp.APIKey != "" {
+		p = provider.NewOpenAIWithConfig(cp.APIKey, cp.Model, cp.BaseURL, cp.MaxTokens, cp.Timeout, cp.ContextWindow)
+	} else if ap, ok := cfg.Providers["anthropic"]; ok && ap.APIKey != "" {
+		p = provider.NewAnthropic(ap.APIKey, ap.Model)
+	} else if op, ok := cfg.Providers["openai"]; ok && op.APIKey != "" {
+		p = provider.NewOpenAI(op.APIKey, op.Model)
+	} else if gp, ok := cfg.Providers["gemini"]; ok && gp.APIKey != "" {
+		p = provider.NewGemini(gp.APIKey, gp.Model)
 	}
 
 	var ag *agent.Agent

@@ -19,9 +19,12 @@ type Config struct {
 
 // Provider holds LLM provider configuration
 type Provider struct {
-	APIKey  string `json:"apiKey"`
-	BaseURL string `json:"baseUrl,omitempty"`
-	Model   string `json:"model,omitempty"`
+	APIKey        string `json:"apiKey"`
+	BaseURL       string `json:"baseUrl,omitempty"`
+	Model         string `json:"model,omitempty"`
+	MaxTokens     int    `json:"maxTokens,omitempty"`      // Default: 65536 (65K) for custom endpoint
+	Timeout       int    `json:"timeout,omitempty"`        // Seconds, default: 600 (10 minutes)
+	ContextWindow int    `json:"contextWindow,omitempty"`  // Default: 131072 (128K)
 }
 
 // MCPServerConfig holds configuration for an MCP server

@@ -1,21 +1,57 @@
 package provider
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/fikriaf/ngodeai-cli/internal/message"
 )
 
-// OpenAIProvider implements the Provider interface for OpenAI
+// Default constants for provider configuration
+const (
+	DefaultMaxTokens     = 65536              // 65K tokens output
+	DefaultTimeout       = 10 * time.Minute   // 10 minutes HTTP timeout
+	DefaultKeepAlive     = 5 * time.Minute    // 5 minutes keep-alive
+	DefaultContextWindow = 131072             // 128K context window
+	DefaultMaxRetries    = 3                  // Retry on timeout/connection errors
+)
+
+// OpenAIProvider implements the Provider interface for OpenAI-compatible APIs
 type OpenAIProvider struct {
-	apiKey  string
-	baseURL string
-	model   Model
+	apiKey     string
+	baseURL    string
+	model      Model
+	httpClient *http.Client
+	maxRetries int
+}
+
+// newHTTPClient creates a custom HTTP client with proper timeout and keep-alive
+func newHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: DefaultKeepAlive,
+		}).DialContext,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     DefaultKeepAlive,
+		DisableKeepAlives:   false,
+		TLSHandshakeTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
 }
 
 // NewOpenAI creates a new OpenAI provider
@@ -27,9 +63,11 @@ func NewOpenAI(apiKey string, modelID string) *OpenAIProvider {
 			ID:            modelID,
 			Name:          modelID,
 			Provider:      "openai",
-			ContextWindow: 128000,
-			MaxTokens:     4096,
+			ContextWindow: DefaultContextWindow,
+			MaxTokens:     DefaultMaxTokens,
 		},
+		httpClient: newHTTPClient(DefaultTimeout),
+		maxRetries: DefaultMaxRetries,
 	}
 }
 
@@ -42,9 +80,46 @@ func NewOpenAIWithBaseURL(apiKey string, modelID string, baseURL string) *OpenAI
 			ID:            modelID,
 			Name:          modelID,
 			Provider:      "custom",
-			ContextWindow: 128000,
-			MaxTokens:     4096,
+			ContextWindow: DefaultContextWindow,
+			MaxTokens:     DefaultMaxTokens, // 65K for custom endpoints
 		},
+		httpClient: newHTTPClient(DefaultTimeout),
+		maxRetries: DefaultMaxRetries,
+	}
+}
+
+// NewOpenAIWithConfig creates a provider with custom configuration
+func NewOpenAIWithConfig(apiKey, modelID, baseURL string, maxTokens, timeoutSec, contextWindow int) *OpenAIProvider {
+	if maxTokens <= 0 {
+		maxTokens = DefaultMaxTokens
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = int(DefaultTimeout.Seconds())
+	}
+	if contextWindow <= 0 {
+		contextWindow = DefaultContextWindow
+	}
+
+	provider := "openai"
+	if baseURL != "" && baseURL != "https://api.openai.com/v1" {
+		provider = "custom"
+	}
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+
+	return &OpenAIProvider{
+		apiKey:  apiKey,
+		baseURL: baseURL,
+		model: Model{
+			ID:            modelID,
+			Name:          modelID,
+			Provider:      provider,
+			ContextWindow: int64(contextWindow),
+			MaxTokens:     int64(maxTokens),
+		},
+		httpClient: newHTTPClient(time.Duration(timeoutSec) * time.Second),
+		maxRetries: DefaultMaxRetries,
 	}
 }
 
@@ -103,8 +178,7 @@ type openaiStreamChunk struct {
 	} `json:"choices"`
 }
 
-func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Message, tools []Tool) (*Response, error) {
-	// Convert messages to OpenAI format
+func (p *OpenAIProvider) buildMessages(messages []message.Message) []openaiMessage {
 	openaiMsgs := make([]openaiMessage, 0, len(messages))
 	for _, msg := range messages {
 		content := ""
@@ -112,17 +186,71 @@ func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Me
 			if tc, ok := part.(message.TextContent); ok {
 				content += tc.Text
 			}
+			if tr, ok := part.(message.ToolResult); ok {
+				content += tr.Content
+			}
 		}
 		if content == "" {
 			continue
 		}
+		role := msg.Role
+		if role == "tool" {
+			role = "user" // Map tool role to user for OpenAI compatibility
+		}
 		openaiMsgs = append(openaiMsgs, openaiMessage{
-			Role:    msg.Role,
+			Role:    role,
 			Content: content,
 		})
 	}
+	return openaiMsgs
+}
 
-	// Build request
+func (p *OpenAIProvider) doRequest(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= p.maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 2s, 4s, 8s
+			time.Sleep(time.Duration(1<<uint(attempt-1)) * 2 * time.Second)
+		}
+
+		resp, err := p.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			// Retry on timeout/connection errors
+			if isRetryableError(err) {
+				continue
+			}
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		// Retry on 429 (rate limit) and 5xx errors
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		return resp, nil
+	}
+	return nil, fmt.Errorf("request failed after %d retries: %w", p.maxRetries, lastErr)
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "broken pipe")
+}
+
+func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Message, tools []Tool) (*Response, error) {
+	openaiMsgs := p.buildMessages(messages)
+
 	reqBody := openaiRequest{
 		Model:       p.model.ID,
 		Messages:    openaiMsgs,
@@ -136,7 +264,6 @@ func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Me
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Make HTTP request
 	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -145,9 +272,9 @@ func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Me
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := p.doRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -180,25 +307,8 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 	go func() {
 		defer close(eventCh)
 
-		// Convert messages
-		openaiMsgs := make([]openaiMessage, 0, len(messages))
-		for _, msg := range messages {
-			content := ""
-			for _, part := range msg.Parts {
-				if tc, ok := part.(message.TextContent); ok {
-					content += tc.Text
-				}
-			}
-			if content == "" {
-				continue
-			}
-			openaiMsgs = append(openaiMsgs, openaiMessage{
-				Role:    msg.Role,
-				Content: content,
-			})
-		}
+		openaiMsgs := p.buildMessages(messages)
 
-		// Build streaming request
 		reqBody := openaiRequest{
 			Model:       p.model.ID,
 			Messages:    openaiMsgs,
@@ -218,8 +328,9 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Connection", "keep-alive")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := p.doRequest(req)
 		if err != nil {
 			eventCh <- Event{Type: EventError, Error: err}
 			return
@@ -232,58 +343,58 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 			return
 		}
 
-		// Read SSE stream
 		eventCh <- Event{Type: EventContentStart}
 
-		buf := make([]byte, 4096)
-		for {
-			n, err := resp.Body.Read(buf)
-			if err != nil && err != io.EOF {
-				eventCh <- Event{Type: EventError, Error: err}
+		// Use bufio.Scanner for reliable SSE line-by-line reading
+		scanner := bufio.NewScanner(resp.Body)
+		// Increase buffer size for large chunks
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+		var tokenUsage *TokenUsage
+
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			// Skip empty lines and comments
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				eventCh <- Event{Type: EventComplete, TokenUsage: tokenUsage}
 				return
 			}
 
-			if n == 0 {
-				break
+			var chunk openaiStreamChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
 			}
 
-			// Parse SSE data lines
-			lines := strings.Split(string(buf[:n]), "\n")
-			for _, line := range lines {
-				if !strings.HasPrefix(line, "data: ") {
-					continue
+			if len(chunk.Choices) > 0 {
+				if chunk.Choices[0].Delta.Content != "" {
+					eventCh <- Event{
+						Type:    EventContentDelta,
+						Content: chunk.Choices[0].Delta.Content,
+					}
 				}
-				data := strings.TrimPrefix(line, "data: ")
-				if data == "[DONE]" {
-					eventCh <- Event{Type: EventComplete}
+				if chunk.Choices[0].FinishReason != nil {
+					eventCh <- Event{Type: EventComplete, TokenUsage: tokenUsage}
 					return
 				}
-
-				var chunk openaiStreamChunk
-				if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-					continue
-				}
-
-				if len(chunk.Choices) > 0 {
-					if chunk.Choices[0].Delta.Content != "" {
-						eventCh <- Event{
-							Type:    EventContentDelta,
-							Content: chunk.Choices[0].Delta.Content,
-						}
-					}
-					if chunk.Choices[0].FinishReason != nil {
-						eventCh <- Event{Type: EventComplete}
-						return
-					}
-				}
-			}
-
-			if err == io.EOF {
-				break
 			}
 		}
 
-		eventCh <- Event{Type: EventComplete}
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			eventCh <- Event{Type: EventError, Error: fmt.Errorf("stream read error: %w", err)}
+			return
+		}
+
+		eventCh <- Event{Type: EventComplete, TokenUsage: tokenUsage}
 	}()
 
 	return eventCh
