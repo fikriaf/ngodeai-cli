@@ -52,10 +52,10 @@ func (a *Agent) buildProviderTools() []provider.Tool {
 	return providerTools
 }
 
-// Run executes the agent loop for a given session (non-streaming, single turn)
+// Run executes the agent loop for a given session with tool calling support
 func (a *Agent) Run(ctx context.Context, sessionID string, userContent string) (string, error) {
 	// Create user message
-	userMsg, err := a.messages.Create(sessionID, "user", []message.ContentPart{
+	_, err := a.messages.Create(sessionID, "user", []message.ContentPart{
 		message.TextContent{Text: userContent},
 	})
 	if err != nil {
@@ -64,36 +64,109 @@ func (a *Agent) Run(ctx context.Context, sessionID string, userContent string) (
 
 	// Check if we need to compact before LLM call
 	if _, err := a.CompactIfNeeded(ctx, sessionID); err != nil {
-		// Log but continue - we don't want to fail the request
 		fmt.Fprintf(os.Stderr, "warning: compaction check failed: %v\n", err)
 	}
 
-	// Get messages (using compacted version if available)
+	// Build in-memory conversation
 	allMessages, err := a.GetCompactedMessages(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("failed to list messages: %w", err)
 	}
+	conversation := make([]message.Message, len(allMessages))
+	copy(conversation, allMessages)
 
-	// Build tool list for provider
 	providerTools := a.buildProviderTools()
 
-	// Simple single-turn for now (no tool loop yet)
-	resp, err := a.provider.SendMessages(ctx, allMessages, providerTools)
-	if err != nil {
-		return "", fmt.Errorf("provider error: %w", err)
+	var finalContent string
+
+	// Agent loop with tool calling
+	for iteration := 0; iteration < maxAgentIterations; iteration++ {
+		resp, err := a.provider.SendMessages(ctx, conversation, providerTools)
+		if err != nil {
+			return "", fmt.Errorf("provider error: %w", err)
+		}
+
+		// Create assistant message with content and tool calls
+		parts := make([]message.ContentPart, 0, 1+len(resp.ToolCalls))
+		if resp.Content != "" {
+			parts = append(parts, message.TextContent{Text: resp.Content})
+		}
+		for _, tc := range resp.ToolCalls {
+			parts = append(parts, tc)
+		}
+		if len(parts) > 0 {
+			if _, err := a.messages.Create(sessionID, "assistant", parts); err != nil {
+				return "", fmt.Errorf("failed to save assistant message: %w", err)
+			}
+		}
+
+		// No tool calls → done
+		if len(resp.ToolCalls) == 0 {
+			finalContent = resp.Content
+			break
+		}
+
+		// Build in-memory assistant message
+		assistantParts := make([]message.ContentPart, 0, 1+len(resp.ToolCalls))
+		if resp.Content != "" {
+			assistantParts = append(assistantParts, message.TextContent{Text: resp.Content})
+		}
+		for _, tc := range resp.ToolCalls {
+			assistantParts = append(assistantParts, tc)
+		}
+		conversation = append(conversation, message.Message{
+			Role:  "assistant",
+			Parts: assistantParts,
+		})
+
+		// Execute each tool
+		for _, tc := range resp.ToolCalls {
+			var resultContent string
+			var isError bool
+
+			tool, ok := a.tools[tc.Name]
+			if !ok {
+				resultContent = fmt.Sprintf("unknown tool: %s", tc.Name)
+				isError = true
+			} else {
+				result, runErr := tool.Run(ctx, tools.ToolCall{
+					CallID: tc.ID,
+					Name:   tc.Name,
+					Args:   tc.Args,
+				})
+				if runErr != nil {
+					resultContent = fmt.Sprintf("Error: %v", runErr)
+					isError = true
+				} else {
+					resultContent = result.Content
+					isError = result.IsError
+				}
+			}
+
+			// Persist tool result
+			a.messages.Create(sessionID, "tool", []message.ContentPart{
+				message.ToolResult{
+					ToolCallID: tc.ID,
+					Content:    resultContent,
+					IsError:    isError,
+				},
+			})
+
+			// Add to in-memory conversation
+			conversation = append(conversation, message.Message{
+				Role: "tool",
+				Parts: []message.ContentPart{
+					message.ToolResult{
+						ToolCallID: tc.ID,
+						Content:    resultContent,
+						IsError:    isError,
+					},
+				},
+			})
+		}
 	}
 
-	// Create assistant message
-	_, err = a.messages.Create(sessionID, "assistant", []message.ContentPart{
-		message.TextContent{Text: resp.Content},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create assistant message: %w", err)
-	}
-
-	_ = userMsg // used for tracking
-
-	return resp.Content, nil
+	return finalContent, nil
 }
 
 // StreamRun executes the full agent loop with streaming: content deltas are

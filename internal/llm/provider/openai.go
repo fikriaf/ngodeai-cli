@@ -16,11 +16,11 @@ import (
 
 // Default constants for provider configuration
 const (
-	DefaultMaxTokens     = 65536              // 65K tokens output
-	DefaultTimeout       = 10 * time.Minute   // 10 minutes HTTP timeout
-	DefaultKeepAlive     = 5 * time.Minute    // 5 minutes keep-alive
-	DefaultContextWindow = 131072             // 128K context window
-	DefaultMaxRetries    = 3                  // Retry on timeout/connection errors
+	DefaultMaxTokens     = 65536            // 65K tokens output
+	DefaultTimeout       = 10 * time.Minute // 10 minutes HTTP timeout
+	DefaultKeepAlive     = 5 * time.Minute  // 5 minutes keep-alive
+	DefaultContextWindow = 131072           // 128K context window
+	DefaultMaxRetries    = 3                // Retry on timeout/connection errors
 )
 
 // OpenAIProvider implements the Provider interface for OpenAI-compatible APIs
@@ -39,11 +39,11 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 			Timeout:   30 * time.Second,
 			KeepAlive: DefaultKeepAlive,
 		}).DialContext,
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 5,
-		IdleConnTimeout:     DefaultKeepAlive,
-		DisableKeepAlives:   false,
-		TLSHandshakeTimeout: 30 * time.Second,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   5,
+		IdleConnTimeout:       DefaultKeepAlive,
+		DisableKeepAlives:     false,
+		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -127,33 +127,53 @@ func (p *OpenAIProvider) Model() Model {
 	return p.model
 }
 
-// openaiRequest is the request payload
+// ── Request/Response types ──────────────────────────────────────────────────
+
 type openaiRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openaiMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Stream      bool            `json:"stream"`
-	Temperature float64         `json:"temperature"`
+	Model       string            `json:"model"`
+	Messages    []openaiMessage   `json:"messages"`
+	MaxTokens   int               `json:"max_tokens"`
+	Stream      bool              `json:"stream"`
+	Temperature float64           `json:"temperature"`
+	Tools       []openaiTool      `json:"tools,omitempty"`
+}
+
+type openaiTool struct {
+	Type     string         `json:"type"`
+	Function openaiFunction `json:"function"`
+}
+
+type openaiFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
 }
 
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string            `json:"role"`
+	Content    string            `json:"content,omitempty"`
+	ToolCalls  []openaiToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
 }
 
-// openaiResponse is the response payload
+type openaiToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type openaiResponse struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Index   int `json:"index"`
-		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
+		Index        int             `json:"index"`
+		Message      openaiMessage   `json:"message"`
+		FinishReason string          `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
@@ -162,47 +182,94 @@ type openaiResponse struct {
 	} `json:"usage"`
 }
 
-// openaiStreamChunk is a streaming chunk
 type openaiStreamChunk struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Index int `json:"index"`
-		Delta struct {
-			Role    string `json:"role,omitempty"`
-			Content string `json:"content,omitempty"`
-		} `json:"delta"`
-		FinishReason *string `json:"finish_reason"`
+		Index        int           `json:"index"`
+		Delta        openaiMessage `json:"delta"`
+		FinishReason *string       `json:"finish_reason"`
 	} `json:"choices"`
 }
+
+// ── Helper functions ────────────────────────────────────────────────────────
 
 func (p *OpenAIProvider) buildMessages(messages []message.Message) []openaiMessage {
 	openaiMsgs := make([]openaiMessage, 0, len(messages))
 	for _, msg := range messages {
-		content := ""
+		var content strings.Builder
+		var toolCalls []openaiToolCall
+		var toolCallID string
+
 		for _, part := range msg.Parts {
-			if tc, ok := part.(message.TextContent); ok {
-				content += tc.Text
-			}
-			if tr, ok := part.(message.ToolResult); ok {
-				content += tr.Content
+			switch v := part.(type) {
+			case message.TextContent:
+				content.WriteString(v.Text)
+			case message.ToolCall:
+				// This is an assistant message with a tool call
+				argsJSON, _ := json.Marshal(v.Args)
+				toolCalls = append(toolCalls, openaiToolCall{
+					ID:   v.ID,
+					Type: "function",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{
+						Name:      v.Name,
+						Arguments: string(argsJSON),
+					},
+				})
+			case message.ToolResult:
+				// This is a tool result message
+				content.WriteString(v.Content)
+				toolCallID = v.ToolCallID
 			}
 		}
-		if content == "" {
+
+		// Skip empty messages (but allow tool results with empty content)
+		if content.Len() == 0 && len(toolCalls) == 0 && toolCallID == "" {
 			continue
 		}
-		role := msg.Role
-		if role == "tool" {
-			role = "user" // Map tool role to user for OpenAI compatibility
+
+		om := openaiMessage{
+			Role:    msg.Role,
+			Content: content.String(),
 		}
-		openaiMsgs = append(openaiMsgs, openaiMessage{
-			Role:    role,
-			Content: content,
-		})
+
+		// Handle assistant messages with tool calls
+		if len(toolCalls) > 0 {
+			om.ToolCalls = toolCalls
+		}
+
+		// Handle tool result messages
+		if toolCallID != "" {
+			om.Role = "tool"
+			om.ToolCallID = toolCallID
+		}
+
+		openaiMsgs = append(openaiMsgs, om)
 	}
 	return openaiMsgs
+}
+
+func (p *OpenAIProvider) buildTools(tools []Tool) []openaiTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	openaiTools := make([]openaiTool, len(tools))
+	for i, t := range tools {
+		openaiTools[i] = openaiTool{
+			Type: "function",
+			Function: openaiFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			},
+		}
+	}
+	return openaiTools
 }
 
 func (p *OpenAIProvider) doRequest(req *http.Request) (*http.Response, error) {
@@ -248,8 +315,11 @@ func isRetryableError(err error) bool {
 		strings.Contains(errStr, "broken pipe")
 }
 
+// ── Provider interface implementation ───────────────────────────────────────
+
 func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Message, tools []Tool) (*Response, error) {
 	openaiMsgs := p.buildMessages(messages)
+	openaiTools := p.buildTools(tools)
 
 	reqBody := openaiRequest{
 		Model:       p.model.ID,
@@ -257,6 +327,7 @@ func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Me
 		MaxTokens:   int(p.model.MaxTokens),
 		Stream:      false,
 		Temperature: 0.7,
+		Tools:       openaiTools,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -292,13 +363,29 @@ func (p *OpenAIProvider) SendMessages(ctx context.Context, messages []message.Me
 		return nil, fmt.Errorf("no choices in response")
 	}
 
-	return &Response{
-		Content: result.Choices[0].Message.Content,
+	choice := result.Choices[0]
+	response := &Response{
+		Content: choice.Message.Content,
 		TokensUsed: TokenUsage{
 			PromptTokens:     int64(result.Usage.PromptTokens),
 			CompletionTokens: int64(result.Usage.CompletionTokens),
 		},
-	}, nil
+	}
+
+	// Parse tool calls from response
+	for _, tc := range choice.Message.ToolCalls {
+		var args map[string]any
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			args = map[string]any{"raw": tc.Function.Arguments}
+		}
+		response.ToolCalls = append(response.ToolCalls, message.ToolCall{
+			ID:   tc.ID,
+			Name: tc.Function.Name,
+			Args: args,
+		})
+	}
+
+	return response, nil
 }
 
 func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.Message, tools []Tool) <-chan Event {
@@ -308,6 +395,7 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 		defer close(eventCh)
 
 		openaiMsgs := p.buildMessages(messages)
+		openaiTools := p.buildTools(tools)
 
 		reqBody := openaiRequest{
 			Model:       p.model.ID,
@@ -315,6 +403,7 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 			MaxTokens:   int(p.model.MaxTokens),
 			Stream:      true,
 			Temperature: 0.7,
+			Tools:       openaiTools,
 		}
 
 		bodyBytes, _ := json.Marshal(reqBody)
@@ -351,6 +440,11 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		var tokenUsage *TokenUsage
+		// Accumulate tool calls across chunks (they come in pieces)
+		var pendingToolCalls []message.ToolCall
+		var currentToolCallID string
+		var currentToolCallName string
+		var currentToolCallArgs strings.Builder
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -366,6 +460,22 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
+				// Flush any pending tool call
+				if currentToolCallID != "" {
+					var args map[string]any
+					if err := json.Unmarshal([]byte(currentToolCallArgs.String()), &args); err != nil {
+						args = map[string]any{"raw": currentToolCallArgs.String()}
+					}
+					pendingToolCalls = append(pendingToolCalls, message.ToolCall{
+						ID:   currentToolCallID,
+						Name: currentToolCallName,
+						Args: args,
+					})
+					eventCh <- Event{
+						Type:     EventToolUseStop,
+						ToolCall: &pendingToolCalls[len(pendingToolCalls)-1],
+					}
+				}
 				eventCh <- Event{Type: EventComplete, TokenUsage: tokenUsage}
 				return
 			}
@@ -376,13 +486,74 @@ func (p *OpenAIProvider) StreamResponse(ctx context.Context, messages []message.
 			}
 
 			if len(chunk.Choices) > 0 {
-				if chunk.Choices[0].Delta.Content != "" {
+				delta := chunk.Choices[0].Delta
+
+				// Handle content delta
+				if delta.Content != "" {
 					eventCh <- Event{
 						Type:    EventContentDelta,
-						Content: chunk.Choices[0].Delta.Content,
+						Content: delta.Content,
 					}
 				}
+
+				// Handle tool calls delta
+				if len(delta.ToolCalls) > 0 {
+					for _, tc := range delta.ToolCalls {
+						// New tool call starting
+						if tc.ID != "" {
+							// Flush previous tool call if any
+							if currentToolCallID != "" {
+								var args map[string]any
+								if err := json.Unmarshal([]byte(currentToolCallArgs.String()), &args); err != nil {
+									args = map[string]any{"raw": currentToolCallArgs.String()}
+								}
+								pendingToolCalls = append(pendingToolCalls, message.ToolCall{
+									ID:   currentToolCallID,
+									Name: currentToolCallName,
+									Args: args,
+								})
+								eventCh <- Event{
+									Type:     EventToolUseStop,
+									ToolCall: &pendingToolCalls[len(pendingToolCalls)-1],
+								}
+							}
+							// Start new tool call
+							currentToolCallID = tc.ID
+							currentToolCallName = tc.Function.Name
+							currentToolCallArgs.Reset()
+							eventCh <- Event{
+								Type: EventToolUseStart,
+								ToolCall: &message.ToolCall{
+									ID:   tc.ID,
+									Name: tc.Function.Name,
+								},
+							}
+						}
+						// Accumulate arguments
+						if tc.Function.Arguments != "" {
+							currentToolCallArgs.WriteString(tc.Function.Arguments)
+						}
+					}
+				}
+
 				if chunk.Choices[0].FinishReason != nil {
+					// Flush any pending tool call
+					if currentToolCallID != "" {
+						var args map[string]any
+						if err := json.Unmarshal([]byte(currentToolCallArgs.String()), &args); err != nil {
+							args = map[string]any{"raw": currentToolCallArgs.String()}
+						}
+						pendingToolCalls = append(pendingToolCalls, message.ToolCall{
+							ID:   currentToolCallID,
+							Name: currentToolCallName,
+							Args: args,
+						})
+						eventCh <- Event{
+							Type:     EventToolUseStop,
+							ToolCall: &pendingToolCalls[len(pendingToolCalls)-1],
+						}
+						currentToolCallID = ""
+					}
 					eventCh <- Event{Type: EventComplete, TokenUsage: tokenUsage}
 					return
 				}
