@@ -50,6 +50,9 @@ type Model struct {
 	// Streaming state (rich events from agent)
 	streaming     bool
 	agentEventCh  <-chan agent.AgentEvent
+	
+	// Model tracking for transparency
+	currentModel  string // Currently selected model name
 
 	// Dialog state
 	activeDialog  activeDialog
@@ -78,12 +81,41 @@ type Model struct {
 	toolExecutions   map[string]*toolcontainer.ToolExecution // Track tool executions by ID
 	toolStartTime    time.Time   // When current tool started
 	completionPopup  completionpopup.Model // Tab completion popup
+	sessionCost      float64     // Total cost for current session
 }
 
 // ChatMessage represents a displayed message
 type ChatMessage struct {
-	Role    string
-	Content string
+	Role       string            // "user" or "assistant"
+	Content    string            // Main message content
+	Timestamp  time.Time         // When message was sent/received
+	Duration   time.Duration     // How long AI took to respond
+	Model      string            // Which model answered
+	Markdown   bool              // Whether content uses markdown rendering
+}
+
+// newMessage creates a message with timestamp
+func newMessage(role, content string) ChatMessage {
+	return ChatMessage{
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+		Markdown:  true,
+	}
+}
+
+// newUserMessage creates a user message
+func newUserMessage(content string) ChatMessage {
+	msg := newMessage("user", content)
+	return msg
+}
+
+// newAssistantMessage creates an assistant message with model and duration
+func newAssistantMessage(content, model string, duration time.Duration) ChatMessage {
+	msg := newMessage("assistant", content)
+	msg.Model = model
+	msg.Duration = duration
+	return msg
 }
 
 // New creates a new TUI model
@@ -115,6 +147,7 @@ func New(a *app.App) Model {
 		mdRenderer:       mdRenderer,
 		toolExecutions:   make(map[string]*toolcontainer.ToolExecution),
 		completionPopup:  completionpopup.New(),
+		currentModel:     a.GetActiveModel(), // Track current model for transparency
 	}
 }
 
@@ -287,7 +320,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					output, action := cmd.Handler(args)
 					
 					// Add command to chat history
-					m.messages = append(m.messages, ChatMessage{Role: "user", Content: content})
+					m.messages = append(m.messages, newUserMessage(content))
 					
 					// Execute action based on type
 					switch action {
@@ -320,6 +353,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								m.app.Config.WorkingDir, m.app.Config.DataDir, m.app.Config.Debug, len(m.app.Config.Providers))
 							m.messages = append(m.messages, ChatMessage{Role: "system", Content: configStr})
 						}
+					case slash.ActionShowCost:
+						if m.app.CostTracker != nil {
+							totalCost := m.app.CostTracker.GetTotalCost()
+							inputTokens, outputTokens, totalTokens := m.app.CostTracker.GetTotalTokens()
+							usage := m.app.CostTracker.GetUsage()
+							
+							costStr := fmt.Sprintf("💰 **Session Cost Breakdown**\n\n")
+							costStr += fmt.Sprintf("```\n")
+							costStr += fmt.Sprintf("Total Tokens:    %d (input: %d, output: %d)\n", totalTokens, inputTokens, outputTokens)
+							costStr += fmt.Sprintf("Total Cost:      $%.4f\n", totalCost)
+							costStr += fmt.Sprintf("Requests:        %d\n", len(usage))
+							costStr += fmt.Sprintf("```\n")
+							
+							if len(usage) > 0 {
+								costStr += fmt.Sprintf("\n**Recent Requests:**\n```\n")
+								start := 0
+								if len(usage) > 5 {
+									start = len(usage) - 5
+								}
+								for i := start; i < len(usage); i++ {
+									u := usage[i]
+									costStr += fmt.Sprintf("%d. %s - %d tokens - $%.4f\n", 
+										i+1, u.Model, u.TotalTokens, u.TotalCost)
+								}
+								costStr += fmt.Sprintf("```\n")
+							}
+							
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: costStr})
+						} else {
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: "💰 **Session Cost:** Cost tracking not available"})
+						}
 					default:
 						// ActionNone or ActionOpenHelp - just show output
 						if output != "" {
@@ -333,7 +397,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				// Regular message - send to agent
-				m.messages = append(m.messages, ChatMessage{Role: "user", Content: content})
+				m.messages = append(m.messages, newUserMessage(content))
 				m.loading = true
 				m.viewport.GotoBottom()
 
@@ -355,7 +419,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionID = msg.sessionID
 		m.agentEventCh = msg.eventCh
 		m.startTime = time.Now()
-		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: ""})
+		m.messages = append(m.messages, newAssistantMessage("", m.currentModel, 0))
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
 		return m, m.waitForAgentEvent()
@@ -448,6 +512,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.startTime.IsZero() {
 				m.responseTime = time.Since(m.startTime)
 				m.startTime = time.Time{}
+				// Update last assistant message with duration
+				if len(m.messages) > 0 {
+					last := &m.messages[len(m.messages)-1]
+					if last.Role == "assistant" {
+						last.Duration = m.responseTime
+						last.Model = m.currentModel
+					}
+				}
+			}
+			// Track cost for this request
+			if m.app.CostTracker != nil {
+				usage := m.app.CostTracker.AddRequest(m.currentModel, event.PromptTokens, event.CompletionTokens)
+				m.sessionCost = m.app.CostTracker.GetTotalCost()
+				_ = usage // Already tracked in CostTracker
 			}
 
 		case agent.EventError:
@@ -464,7 +542,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == "assistant" {
 					m.messages[len(m.messages)-1].Content += errText
 				} else {
-					m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: fmt.Sprintf("Error: %v", event.Error)})
+					m.messages = append(m.messages, newAssistantMessage(fmt.Sprintf("Error: %v", event.Error), "unknown", 0))
 				}
 			}
 		}
@@ -483,7 +561,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.sessionID = msg.sessionID
 		if msg.err != nil {
-			m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: fmt.Sprintf("Error: %v", msg.err)})
+			m.messages = append(m.messages, newAssistantMessage(fmt.Sprintf("Error: %v", msg.err), "unknown", 0))
 		} else {
 			m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: msg.content})
 		}
@@ -622,6 +700,8 @@ func (m *Model) handleModelSelection(info dialog.ModelSelectedMsg) {
 	}
 
 	m.app.Agent.SetProvider(p)
+	// Track model for transparency
+	m.currentModel = info.Name
 	m.messages = append(m.messages, ChatMessage{
 		Role:    "system",
 		Content: fmt.Sprintf("✓ Switched to %s (%s)", info.Name, info.Provider),
@@ -672,6 +752,7 @@ func (m Model) View() string {
 	statusInfo.ResponseTime = m.responseTime
 	statusInfo.PromptTokens = m.promptTokens
 	statusInfo.CompletionTokens = m.completionTokens
+	statusInfo.CostUSD = m.sessionCost // Track session cost
 	statusInfo.ThemeName = m.currentTheme
 
 	if m.app.Agent != nil {
@@ -762,6 +843,13 @@ func (m Model) renderMessages() string {
 
 	contentStyle := lipgloss.NewStyle().Padding(0, 1).MaxWidth(80)
 
+	// Meta info style (timestamp, duration, model)
+	metaStyle := lipgloss.NewStyle().
+		Foreground(t.TextMuted).
+		Italic(true).
+		MarginTop(0).
+		MarginBottom(0)
+
 	// Streaming cursor uses the assistant message color
 	sCursor := lipgloss.NewStyle().
 		Foreground(t.AssistantMsg).
@@ -772,10 +860,30 @@ func (m Model) renderMessages() string {
 		switch msg.Role {
 		case "user":
 			b.WriteString(userMsgStyle.Render("You"))
+			if !msg.Timestamp.IsZero() {
+				timeStr := msg.Timestamp.Format("3:04 PM")
+				b.WriteString(metaStyle.Render(fmt.Sprintf(" • %s", timeStr)))
+			}
 			b.WriteString("\n")
 			b.WriteString(contentStyle.Render(msg.Content))
 		case "assistant":
 			b.WriteString(assistantMsgStyle.Render("NgodeAI"))
+			// Show model name and timing info
+			modelInfo := ""
+			if msg.Model != "" && msg.Model != "unknown" {
+				// Shorten model name for display
+				displayModel := msg.Model
+				if len(displayModel) > 30 {
+					displayModel = displayModel[:27] + "..."
+				}
+				modelInfo = fmt.Sprintf(" • %s", displayModel)
+				if msg.Duration != 0 {
+					modelInfo += fmt.Sprintf(" • %d:%02d", int(msg.Duration/time.Minute), int(msg.Duration/time.Second)%60)
+				}
+			}
+			if modelInfo != "" {
+				b.WriteString(metaStyle.Render(modelInfo))
+			}
 			b.WriteString("\n")
 			content := msg.Content
 			if m.streaming && i == len(m.messages)-1 {

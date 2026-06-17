@@ -29,6 +29,7 @@ const (
 	ActionCompact                  // Trigger session compaction
 	ActionNewSession               // Create new session
 	ActionShowConfig               // Show current config
+	ActionShowCost                 // Show current session cost
 )
 
 // Registry holds all registered slash commands
@@ -169,6 +170,14 @@ func (r *Registry) registerDefaults() {
 			Description: "Show token usage and stats",
 			Handler: func(args string) (string, Action) {
 				return "📊 **Token Usage**\n\n```\nSession tokens: Calculating...\nTotal cost: $0.00\n```", ActionNone
+			},
+		},
+		{
+			Name:        "cost",
+			Aliases:     []string{"price", "$"},
+			Description: "Show current session cost",
+			Handler: func(args string) (string, Action) {
+				return "💰 **Session Cost**\n\n```\nCalculating...", ActionShowCost
 			},
 		},
 		{

@@ -7,6 +7,7 @@ import (
 
 	"github.com/fikriaf/ngodeai-cli/internal/commands"
 	"github.com/fikriaf/ngodeai-cli/internal/config"
+	"github.com/fikriaf/ngodeai-cli/internal/cost"
 	"github.com/fikriaf/ngodeai-cli/internal/db"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
@@ -24,6 +25,7 @@ type App struct {
 	Agent       *agent.Agent
 	Commands    *commands.Service
 	MCPService  *mcp.Service
+	CostTracker *cost.Tracker
 }
 
 // New creates a new App instance
@@ -94,13 +96,29 @@ func New(ctx context.Context, conn *db.Connection, cfg *config.Config) (*App, er
 	}
 
 	return &App{
-		Sessions:   sessions,
-		Messages:   messages,
-		Config:     cfg,
-		Agent:      ag,
-		Commands:   cmdSvc,
-		MCPService: mcpSvc,
+		Sessions:    sessions,
+		Messages:    messages,
+		Config:      cfg,
+		Agent:       ag,
+		Commands:    cmdSvc,
+		MCPService:  mcpSvc,
+		CostTracker: cost.NewTracker(),
 	}, nil
+}
+
+// GetActiveModel returns the currently selected model name
+func (a *App) GetActiveModel() string {
+	if a.Config == nil || len(a.Config.Providers) == 0 {
+		return "unknown"
+	}
+	
+	// Check in order: custom, anthropic, openai, gemini
+	for _, provider := range []string{"custom", "anthropic", "openai", "gemini"} {
+		if p, ok := a.Config.Providers[provider]; ok && p.Model != "" {
+			return p.Model
+		}
+	}
+	return "unknown"
 }
 
 // Close cleans up resources

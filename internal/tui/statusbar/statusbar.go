@@ -118,6 +118,13 @@ func Render(info Info, themeName string) string {
 			Render(fmt.Sprintf("🔌 %d/%d", info.MCPConnected, info.MCPTotal))
 	}
 
+	costSection := ""
+	if info.CostUSD > 0 {
+		costSection = lipgloss.NewStyle().
+			Foreground(t.TextMuted).
+			Render(fmt.Sprintf("💰 %s", formatCost(info.CostUSD)))
+	}
+
 	keybindHint := lipgloss.NewStyle().
 		Foreground(t.TextMuted).
 		Faint(true).
@@ -127,6 +134,9 @@ func Render(info Info, themeName string) string {
 	rightParts := []string{}
 	if tokensSection != "" {
 		rightParts = append(rightParts, tokensSection)
+	}
+	if costSection != "" {
+		rightParts = append(rightParts, costSection)
 	}
 	if mcpSection != "" {
 		rightParts = append(rightParts, mcpSection)
@@ -203,4 +213,15 @@ func formatTokens(n int64) string {
 		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+func formatCost(cost float64) string {
+	if cost < 0.01 {
+		return "< $0.01"
+	}
+	if cost < 1.00 {
+		cents := cost * 100
+		return fmt.Sprintf("%.2f¢", cents)
+	}
+	return fmt.Sprintf("$%.2f", cost)
 }
