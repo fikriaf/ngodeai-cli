@@ -77,8 +77,10 @@ func New(ctx context.Context, conn *db.Connection, cfg *config.Config) (*App, er
 		toolList = append(toolList, mcpTools...)
 	}
 
-	// Check for Anthropic first, then OpenAI, then Gemini
-	if cfg.Providers["anthropic"].APIKey != "" {
+	// Check for custom provider first, then Anthropic, OpenAI, Gemini
+	if cfg.Providers["custom"].APIKey != "" {
+		p = provider.NewOpenAIWithBaseURL(cfg.Providers["custom"].APIKey, cfg.Providers["custom"].Model, cfg.Providers["custom"].BaseURL)
+	} else if cfg.Providers["anthropic"].APIKey != "" {
 		p = provider.NewAnthropic(cfg.Providers["anthropic"].APIKey, cfg.Providers["anthropic"].Model)
 	} else if cfg.Providers["openai"].APIKey != "" {
 		p = provider.NewOpenAI(cfg.Providers["openai"].APIKey, cfg.Providers["openai"].Model)

@@ -33,6 +33,21 @@ func NewOpenAI(apiKey string, modelID string) *OpenAIProvider {
 	}
 }
 
+// NewOpenAIWithBaseURL creates an OpenAI-compatible provider with custom base URL
+func NewOpenAIWithBaseURL(apiKey string, modelID string, baseURL string) *OpenAIProvider {
+	return &OpenAIProvider{
+		apiKey:  apiKey,
+		baseURL: baseURL,
+		model: Model{
+			ID:            modelID,
+			Name:          modelID,
+			Provider:      "custom",
+			ContextWindow: 128000,
+			MaxTokens:     4096,
+		},
+	}
+}
+
 func (p *OpenAIProvider) Model() Model {
 	return p.model
 }
