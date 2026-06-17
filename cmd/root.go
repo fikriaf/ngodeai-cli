@@ -19,7 +19,7 @@ var (
 	cwd     string
 	prompt  string
 	debug   bool
-	version string = "0.4.0"
+	version string = "0.5.0"
 )
 
 var rootCmd = &cobra.Command{

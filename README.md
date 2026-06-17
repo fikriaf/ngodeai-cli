@@ -279,13 +279,15 @@ git push origin v0.3.0
 - [x] Session management
 - [x] Message system
 - [x] Interactive TUI (Bubble Tea)
-- [x] LLM provider integration (OpenAI, Anthropic)
+- [x] LLM provider integration (OpenAI, Anthropic, Gemini)
 - [x] Tool system implementation
 - [x] Session browser component
-- [ ] LSP integration
-- [ ] MCP protocol support
-- [ ] Theme system
-- [ ] Auto-compaction
+- [x] Streaming responses
+- [x] Theme system
+- [x] Auto-compaction
+- [x] LSP integration
+- [x] MCP protocol support
+- [x] Model/theme/file pickers
 - [ ] Multi-file editing
 - [ ] Git integration
 
