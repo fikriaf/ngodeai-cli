@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fikriaf/ngodeai-cli/internal/app"
+	"github.com/fikriaf/ngodeai-cli/internal/export"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/autocomplete"
@@ -383,6 +384,59 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.messages = append(m.messages, ChatMessage{Role: "system", Content: costStr})
 						} else {
 							m.messages = append(m.messages, ChatMessage{Role: "system", Content: "💰 **Session Cost:** Cost tracking not available"})
+						}
+					case slash.ActionExport:
+						// Determine format from args
+						format := "markdown"
+						if args != "" {
+							format = strings.ToLower(args)
+						}
+						
+						// Convert ChatMessages to export format
+						var exportMessages []export.ChatMessage
+						for _, msg := range m.messages {
+							if msg.Role == "user" || msg.Role == "assistant" {
+								exportMessages = append(exportMessages, export.ChatMessage{
+									Role:      msg.Role,
+									Content:   msg.Content,
+									Timestamp: msg.Timestamp,
+									Model:     msg.Model,
+								})
+							}
+						}
+						
+						// Generate filename with timestamp
+						timestamp := time.Now().Format("20060102-150405")
+						var filename, content string
+						var err error
+						
+						if format == "json" {
+							filename = fmt.Sprintf("ngodeai-chat-%s.json", timestamp)
+							content, err = export.ExportJSON(exportMessages, m.sessionID)
+						} else {
+							filename = fmt.Sprintf("ngodeai-chat-%s.md", timestamp)
+							content = export.ExportMarkdown(exportMessages, m.sessionID)
+						}
+						
+						if err != nil {
+							m.messages = append(m.messages, ChatMessage{
+								Role:    "system",
+								Content: fmt.Sprintf("❌ **Export Failed**\n\n```%s```", err.Error()),
+							})
+						} else {
+							// Save to file
+							err = export.SaveToFile(filename, content)
+							if err != nil {
+								m.messages = append(m.messages, ChatMessage{
+									Role:    "system",
+									Content: fmt.Sprintf("❌ **Export Failed**\n\n```%s```", err.Error()),
+								})
+							} else {
+								m.messages = append(m.messages, ChatMessage{
+									Role:    "system",
+									Content: fmt.Sprintf("✅ **Export Successful**\n\n```\nFile: %s\nMessages: %d\n```\n\n💾 Chat exported to current directory", filename, len(exportMessages)),
+								})
+							}
 						}
 					default:
 						// ActionNone or ActionOpenHelp - just show output

@@ -30,6 +30,7 @@ const (
 	ActionNewSession               // Create new session
 	ActionShowConfig               // Show current config
 	ActionShowCost                 // Show current session cost
+	ActionExport                   // Export chat to file
 )
 
 // Registry holds all registered slash commands
@@ -186,6 +187,25 @@ func (r *Registry) registerDefaults() {
 			Description: "Show current configuration",
 			Handler: func(args string) (string, Action) {
 				return "", ActionShowConfig
+			},
+		},
+		{
+			Name:        "export",
+			Aliases:     []string{"save", "backup"},
+			Description: "Export chat to markdown/json file",
+			Handler: func(args string) (string, Action) {
+				format := "markdown"
+				if args != "" {
+					format = strings.ToLower(args)
+				}
+				msg := fmt.Sprintf("💾 **Export Chat**\n\n```\n")
+				if format == "json" {
+					msg += "Format: JSON\nFilename: ngodeai-chat-YYYYMMDD-HHMMSS.json"
+				} else {
+					msg += "Format: Markdown\nFilename: ngodeai-chat-YYYYMMDD-HHMMSS.md"
+				}
+				msg += "\n```\n\n👉 Generating export..."
+				return msg, ActionExport
 			},
 		},
 		{
