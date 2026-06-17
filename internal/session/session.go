@@ -140,6 +140,19 @@ func (s *Service) UpdateSummaryMessageID(sessionID string, summaryMessageID stri
 	return nil
 }
 
+// UpdateTitle updates the title for a session
+func (s *Service) UpdateTitle(sessionID string, title string) error {
+	_, err := s.db.Exec(`
+		UPDATE sessions 
+		SET title = ?, updated_at = ?
+		WHERE id = ?
+	`, title, time.Now().Unix(), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to update session title: %w", err)
+	}
+	return nil
+}
+
 // Subscribe returns a channel for session events
 func (s *Service) Subscribe(ctx context.Context) <-chan Event {
 	return s.broker.Subscribe(ctx)

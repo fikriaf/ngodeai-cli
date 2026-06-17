@@ -137,7 +137,7 @@ func New(a *app.App) Model {
 	// Initialize markdown renderer
 	mdRenderer, _ := markdown.NewRenderer("default")
 
-	return Model{
+	m := Model{
 		app:              a,
 		textarea:         ta,
 		viewport:         vp,
@@ -151,6 +151,25 @@ func New(a *app.App) Model {
 		completionPopup:  completionpopup.New(),
 		currentModel:     a.GetActiveModel(), // Track current model for transparency
 	}
+
+	// Auto-load the most recent session if available
+	if a.Sessions != nil {
+		sessions, err := a.Sessions.List()
+		if err == nil && len(sessions) > 0 {
+			// Load the most recent session (first in list, sorted by updated_at DESC)
+			latestSession := sessions[0]
+			if err := m.loadSession(latestSession.ID); err == nil {
+				// Successfully loaded, add a welcome message
+				m.messages = append([]ChatMessage{
+					{Role: "system", Content: fmt.Sprintf("📂 Auto-loaded session: %s (updated %s)", 
+						latestSession.Title, 
+						time.Unix(latestSession.UpdatedAt, 0).Format("2006-01-02 15:04"))},
+				}, m.messages...)
+			}
+		}
+	}
+
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -350,12 +369,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.messages = append(m.messages, ChatMessage{Role: "system", Content: sessionsStr})
 						}
 						case slash.ActionSwitchSession:
-						// Switch to a specific session by number or ID
+						// Switch to a specific session by number or ID, or handle subcommands
 						if output == "" {
 							m.messages = append(m.messages, ChatMessage{Role: "system", Content: "❌ Please provide a session number (e.g., `/session 1`)"})
 							break
 						}
 					
+						// Check for subcommands: search, delete
+						parts := strings.SplitN(output, " ", 2)
+						if len(parts) == 2 {
+							subcmd := strings.ToLower(parts[0])
+							arg := strings.TrimSpace(parts[1])
+							
+							switch subcmd {
+							case "search":
+								if arg == "" {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: "❌ Please provide a search keyword (e.g., `/session search python`)"})
+									break
+								}
+								result, err := m.searchSessions(arg)
+								if err != nil {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ %s", err)})
+								} else {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: result})
+								}
+								break
+								
+							case "delete", "del", "rm":
+								var sessionNum int
+								if _, err := fmt.Sscanf(arg, "%d", &sessionNum); err != nil {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: "❌ Please provide a session number (e.g., `/session delete 1`)"})
+									break
+								}
+								result, err := m.deleteSession(sessionNum)
+								if err != nil {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ %s", err)})
+								} else {
+									m.messages = append(m.messages, ChatMessage{Role: "system", Content: result})
+								}
+								break
+								
+							default:
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ Unknown subcommand: %s\n\nUse: `/session search <keyword>` or `/session delete <number>`", subcmd)})
+								break
+							}
+							break
+						}
+						
 						// Try to parse as number first
 						var sessionNum int
 						if _, err := fmt.Sscanf(output, "%d", &sessionNum); err == nil {
@@ -1059,7 +1119,9 @@ func (m Model) startStreaming(content string) tea.Cmd {
 
 		sessionID := m.sessionID
 		if sessionID == "" {
-			sess, err := m.app.Sessions.Create("TUI Session")
+			// Create session with title from first message
+			title := truncate(content, 50)
+			sess, err := m.app.Sessions.Create(title)
 			if err != nil {
 				return agentSetupMsg{content: content, err: err}
 			}
@@ -1108,7 +1170,9 @@ func (m Model) sendMessage(content string) tea.Cmd {
 
 		sessionID := m.sessionID
 		if sessionID == "" {
-			sess, err := m.app.Sessions.Create("TUI Session")
+			// Create session with title from first message
+			title := truncate(content, 50)
+			sess, err := m.app.Sessions.Create(title)
 			if err != nil {
 				return responseMsg{err: err}
 			}
@@ -1222,6 +1286,114 @@ func (m *Model) listSessions() (string, error) {
 	sb.WriteString("```\n\n")
 	sb.WriteString("👉 Use `/session <number>` to switch to a session\n")
 	sb.WriteString("👉 Use `/session delete <number>` to delete a session\n")
+	sb.WriteString("👉 Use `/session search <keyword>` to search sessions\n")
 
 	return sb.String(), nil
+}
+
+// searchSessions searches sessions by title or content
+func (m *Model) searchSessions(keyword string) (string, error) {
+	if m.app.Sessions == nil {
+		return "", fmt.Errorf("session service not available")
+	}
+
+	sessions, err := m.app.Sessions.List()
+	if err != nil {
+		return "", fmt.Errorf("failed to list sessions: %w", err)
+	}
+
+	keyword = strings.ToLower(keyword)
+	var matches []int
+	
+	for i, sess := range sessions {
+		// Search in title
+		if strings.Contains(strings.ToLower(sess.Title), keyword) {
+			matches = append(matches, i)
+			continue
+		}
+		
+		// Search in messages
+		if m.app.Messages != nil {
+			msgs, err := m.app.Messages.List(sess.ID)
+			if err == nil {
+				for _, msg := range msgs {
+					for _, part := range msg.Parts {
+						if tc, ok := part.(message.TextContent); ok {
+							if strings.Contains(strings.ToLower(tc.Text), keyword) {
+								matches = append(matches, i)
+								goto nextSession
+							}
+						}
+					}
+				}
+			}
+		}
+		nextSession:
+	}
+
+	if len(matches) == 0 {
+		return fmt.Sprintf("🔍 **No sessions found** containing '%s'\n\nTry a different keyword.", keyword), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔍 **Found %d session(s)** containing '%s'\n\n", len(matches), keyword))
+	sb.WriteString("```\n")
+	sb.WriteString(fmt.Sprintf("%-4s  %-20s  %-8s  %s\n", "ID", "Title", "Messages", "Updated"))
+	sb.WriteString(fmt.Sprintf("%-4s  %-20s  %-8s  %s\n", "----", "--------------------", "--------", "-------------------"))
+	
+	for _, idx := range matches {
+		sess := sessions[idx]
+		title := sess.Title
+		if len(title) > 20 {
+			title = title[:17] + "..."
+		}
+		updated := time.Unix(sess.UpdatedAt, 0).Format("2006-01-02 15:04")
+		sb.WriteString(fmt.Sprintf("%-4d  %-20s  %-8d  %s\n",
+			idx+1, title, sess.MessageCount, updated))
+	}
+	sb.WriteString("```\n\n")
+	sb.WriteString("👉 Use `/session <number>` to switch to a session\n")
+
+	return sb.String(), nil
+}
+
+// deleteSession deletes a session by number
+func (m *Model) deleteSession(sessionNum int) (string, error) {
+	if m.app.Sessions == nil {
+		return "", fmt.Errorf("session service not available")
+	}
+
+	sessions, err := m.app.Sessions.List()
+	if err != nil {
+		return "", fmt.Errorf("failed to list sessions: %w", err)
+	}
+
+	if sessionNum < 1 || sessionNum > len(sessions) {
+		return "", fmt.Errorf("invalid session number: %d (valid: 1-%d)", sessionNum, len(sessions))
+	}
+
+	sess := sessions[sessionNum-1]
+	
+	// Delete the session
+	if err := m.app.Sessions.Delete(sess.ID); err != nil {
+		return "", fmt.Errorf("failed to delete session: %w", err)
+	}
+
+	// If we're currently on this session, clear it
+	if m.sessionID == sess.ID {
+		m.sessionID = ""
+		m.messages = []ChatMessage{
+			{Role: "system", Content: "🗑️ Current session deleted"},
+		}
+		m.promptTokens = 0
+		m.completionTokens = 0
+		m.toolResults = 0
+		m.currentIteration = 0
+		if m.app.CostTracker != nil {
+			m.app.CostTracker.Reset()
+			m.sessionCost = 0
+		}
+	}
+
+	return fmt.Sprintf("✅ **Session deleted:** %s\n\nThe conversation history has been removed from the database.", sess.Title), nil
 }
