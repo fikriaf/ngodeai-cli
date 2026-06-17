@@ -13,7 +13,9 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/app"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/autocomplete"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/completionpopup"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/markdown"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/slash"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/sidebar"
@@ -75,6 +77,7 @@ type Model struct {
 	toolResults      int         // Number of tool results in current session
 	toolExecutions   map[string]*toolcontainer.ToolExecution // Track tool executions by ID
 	toolStartTime    time.Time   // When current tool started
+	completionPopup  completionpopup.Model // Tab completion popup
 }
 
 // ChatMessage represents a displayed message
@@ -111,6 +114,7 @@ func New(a *app.App) Model {
 		slashRegistry:    slash.NewRegistry(),
 		mdRenderer:       mdRenderer,
 		toolExecutions:   make(map[string]*toolcontainer.ToolExecution),
+		completionPopup:  completionpopup.New(),
 	}
 }
 
@@ -241,6 +245,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Toggle sidebar
 			m.showSidebar = !m.showSidebar
 			return m, nil
+
+		case "tab":
+			if m.completionPopup.Visible {
+				// Tab to apply completion
+				if sel := m.completionPopup.Selected(); sel != nil {
+					cursorPos := len(m.textarea.Value())
+					newInput, newPos := autocomplete.ApplyCompletion(m.textarea.Value(), *sel, cursorPos)
+					m.textarea.SetValue(newInput)
+					m.textarea.SetCursor(newPos)
+					m.completionPopup.Hide()
+					return m, nil
+				}
+			} else {
+				// Show completions at current cursor position
+				text := m.textarea.Value()
+				cursorPos := len(text) // Use end of text as cursor position
+				completions := autocomplete.GetCompletions(text, m.slashRegistry, cursorPos)
+				if len(completions) > 0 {
+					m.completionPopup.Show(completions)
+				}
+			}
+
+		case "shift+tab":
+			// Navigate to previous completion
+			if m.completionPopup.Visible {
+				m.completionPopup.Prev()
+			}
+
+		case "esc":
+			// Hide completion popup
+			m.completionPopup.Hide()
 
 		case "enter":
 			if m.textarea.Value() != "" && !m.loading {
@@ -689,6 +724,12 @@ func (m Model) View() string {
 	}
 
 	footer := m.textarea.View()
+	
+	// Render completion popup if visible
+	if m.completionPopup.Visible {
+		popup := m.completionPopup.Render(m.currentTheme, m.width-4)
+		footer = popup + "\n" + footer
+	}
 
 	separator := strings.Repeat("─", max(m.width, 1))
 	sepStyle := lipgloss.NewStyle().Foreground(t.TextMuted)
