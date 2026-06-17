@@ -147,6 +147,11 @@ func customSetup(reader *bufio.Reader) ProviderConfig {
 	fmt.Print("   Base URL (e.g., http://localhost:11434/v1): ")
 	baseURL, _ := reader.ReadString('\n')
 	baseURL = strings.TrimSpace(baseURL)
+	// Validate and fix URL format
+	if strings.Contains(baseURL, "::") {
+		baseURL = strings.ReplaceAll(baseURL, "::", "://")
+		fmt.Printf("   Fixed URL to: %s\n", baseURL)
+	}
 
 	fmt.Print("   Model name (e.g., llama3, qwen2.5): ")
 	model, _ := reader.ReadString('\n')

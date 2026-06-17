@@ -25,32 +25,39 @@ type Message struct {
 // ContentPart is a polymorphic message content piece
 type ContentPart interface {
 	isPart()
+	Type() string
 }
 
 // TextContent is plain text
 type TextContent struct {
+	Kind string `json:"type"`
 	Text string `json:"text"`
 }
 
 func (t TextContent) isPart() {}
+func (t TextContent) Type() string { return "text" }
 
 // ToolCall represents an LLM-initiated tool invocation
 type ToolCall struct {
+	Kind string         `json:"type"`
 	ID   string         `json:"id"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
 }
 
 func (t ToolCall) isPart() {}
+func (t ToolCall) Type() string { return "tool_call" }
 
 // ToolResult is the result of a tool execution
 type ToolResult struct {
+	Kind       string `json:"type"`
 	ToolCallID string `json:"toolCallId"`
 	Content    string `json:"content"`
 	IsError    bool   `json:"isError"`
 }
 
 func (t ToolResult) isPart() {}
+func (t ToolResult) Type() string { return "tool_result" }
 
 // Service provides message CRUD operations
 type Service struct {
@@ -77,8 +84,31 @@ func (s *Service) Create(sessionID string, role string, parts []ContentPart) (Me
 	id := uuid.New().String()
 	now := time.Now().Unix()
 
-	// Serialize parts to JSON
-	partsJSON, err := json.Marshal(parts)
+	// Ensure each part has a type field, then serialize
+	type typedPart struct {
+		Type       string         `json:"type"`
+		Text       string         `json:"text,omitempty"`
+		ID         string         `json:"id,omitempty"`
+		Name       string         `json:"name,omitempty"`
+		Args       map[string]any `json:"args,omitempty"`
+		ToolCallID string         `json:"toolCallId,omitempty"`
+		Content    string         `json:"content,omitempty"`
+		IsError    bool           `json:"isError,omitempty"`
+	}
+
+	var serializable []typedPart
+	for _, p := range parts {
+		switch v := p.(type) {
+		case TextContent:
+			serializable = append(serializable, typedPart{Type: "text", Text: v.Text})
+		case ToolCall:
+			serializable = append(serializable, typedPart{Type: "tool_call", ID: v.ID, Name: v.Name, Args: v.Args})
+		case ToolResult:
+			serializable = append(serializable, typedPart{Type: "tool_result", ToolCallID: v.ToolCallID, Content: v.Content, IsError: v.IsError})
+		}
+	}
+
+	partsJSON, err := json.Marshal(serializable)
 	if err != nil {
 		return Message{}, fmt.Errorf("failed to serialize parts: %w", err)
 	}
@@ -124,9 +154,50 @@ func (s *Service) List(sessionID string) ([]Message, error) {
 			return nil, err
 		}
 
-		// Deserialize parts
-		if err := json.Unmarshal([]byte(partsJSON), &msg.Parts); err != nil {
-			return nil, fmt.Errorf("failed to deserialize parts: %w", err)
+		// Deserialize parts with custom handling for polymorphic types
+		var rawParts []json.RawMessage
+		if err := json.Unmarshal([]byte(partsJSON), &rawParts); err != nil {
+			return nil, fmt.Errorf("failed to deserialize raw parts: %w", err)
+		}
+
+		for _, raw := range rawParts {
+			var partMap map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &partMap); err != nil {
+				// Fallback: try as TextContent without type field
+				var tc TextContent
+				if err2 := json.Unmarshal(raw, &tc); err2 == nil {
+					tc.Kind = "text"
+					msg.Parts = append(msg.Parts, tc)
+				}
+				continue
+			}
+
+			var partType string
+			if t, ok := partMap["type"]; ok {
+				json.Unmarshal(t, &partType)
+			}
+
+			switch partType {
+			case "text":
+				var tc TextContent
+				json.Unmarshal(raw, &tc)
+				msg.Parts = append(msg.Parts, tc)
+			case "tool_call":
+				var tc ToolCall
+				json.Unmarshal(raw, &tc)
+				msg.Parts = append(msg.Parts, tc)
+			case "tool_result":
+				var tr ToolResult
+				json.Unmarshal(raw, &tr)
+				msg.Parts = append(msg.Parts, tr)
+			default:
+				// Try as TextContent (legacy format)
+				var tc TextContent
+				if err := json.Unmarshal(raw, &tc); err == nil {
+					tc.Kind = "text"
+					msg.Parts = append(msg.Parts, tc)
+				}
+			}
 		}
 
 		messages = append(messages, msg)
