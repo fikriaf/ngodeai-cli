@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -13,6 +14,8 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/slash"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/sidebar"
+	"github.com/fikriaf/ngodeai-cli/internal/tui/statusbar"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/theme"
 )
 
@@ -55,6 +58,13 @@ type Model struct {
 
 	// Slash command registry
 	slashRegistry *slash.Registry
+
+	// UI state
+	showSidebar    bool      // Toggle sidebar visibility (ctrl+b)
+	startTime      time.Time // When streaming/thinking started
+	responseTime   time.Duration // Last response time
+	promptTokens   int64
+	completionTokens int64
 }
 
 // ChatMessage represents a displayed message
@@ -212,6 +222,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filePicker = dialog.NewFilePicker(startDir)
 			return m, m.filePicker.Init()
 
+		case "ctrl+b":
+			// Toggle sidebar
+			m.showSidebar = !m.showSidebar
+			return m, nil
+
 		case "enter":
 			if m.textarea.Value() != "" && !m.loading {
 				content := m.textarea.Value()
@@ -290,6 +305,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionID = msg.sessionID
 		m.streamContentCh = msg.contentCh
 		m.streamErrCh = msg.errCh
+		m.startTime = time.Now() // Record start time for response tracking
 		m.messages = append(m.messages, ChatMessage{Role: "assistant", Content: ""})
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
@@ -311,6 +327,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.streamContentCh = nil
 		m.streamErrCh = nil
+		if !m.startTime.IsZero() {
+			m.responseTime = time.Since(m.startTime)
+			m.startTime = time.Time{}
+		}
 		if msg.err != nil {
 			errText := fmt.Sprintf("\n\n⚠ Error: %v", msg.err)
 			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == "assistant" {
@@ -506,24 +526,66 @@ func (m Model) View() string {
 		Foreground(t.Primary).
 		Padding(0, 1)
 
-	statusStyle := lipgloss.NewStyle().
-		Foreground(t.TextMuted).
-		Padding(0, 1)
+	header := titleStyle.Render("NgodeAI CLI v0.6.0")
 
-	header := titleStyle.Render("NgodeAI CLI v0.4.0")
+	// ── Render status bar (bottom) ──
+	var statusInfo statusbar.Info
+	statusInfo.Width = m.width
+	statusInfo.Streaming = m.streaming
+	statusInfo.Loading = m.loading
+	statusInfo.StartTime = m.startTime
+	statusInfo.ResponseTime = m.responseTime
+	statusInfo.PromptTokens = m.promptTokens
+	statusInfo.CompletionTokens = m.completionTokens
+	statusInfo.ThemeName = m.currentTheme
 
-	status := ""
-	if m.streaming {
-		status = statusStyle.Render("Streaming…")
-	} else if m.loading {
-		status = statusStyle.Render("Thinking...")
-	} else if m.app.Agent != nil {
+	if m.app.Agent != nil {
 		modelInfo := m.app.Agent.Provider().Model()
-		themeLabel := ""
-		if m.currentTheme != "default" {
-			themeLabel = fmt.Sprintf(" · 🎨 %s", m.currentTheme)
+		statusInfo.ModelName = modelInfo.Name
+		statusInfo.ProviderName = modelInfo.Provider
+		statusInfo.ContextWindow = modelInfo.ContextWindow
+	}
+	if m.sessionID != "" {
+		statusInfo.SessionName = truncate(m.sessionID, 15)
+	}
+
+	statusBar := statusbar.Render(statusInfo, m.currentTheme)
+
+	// ── Render sidebar (optional right panel) ──
+	var sidebarView string
+	sidebarWidth := 0
+	if m.showSidebar && m.app.Agent != nil {
+		modelInfo := m.app.Agent.Provider().Model()
+		sidebarData := sidebar.Data{
+			SessionName:  m.sessionID,
+			MessageCount: int64(len(m.messages)),
+			Tokens:       m.promptTokens + m.completionTokens,
+			ModelName:    modelInfo.Name,
+			ModelID:      modelInfo.ID,
+			ProviderName: modelInfo.Provider,
+			ContextWindow: modelInfo.ContextWindow,
+			MaxTokens:    modelInfo.MaxTokens,
+			ThemeName:    m.currentTheme,
 		}
-		status = statusStyle.Render(fmt.Sprintf("Model: %s (%s)%s", modelInfo.Name, modelInfo.Provider, themeLabel))
+		sidebarView = sidebar.Render(sidebarData, m.currentTheme)
+		sidebarWidth = 30 // Fixed width for now
+	}
+
+	// ── Layout: chat viewport (with optional sidebar) ──
+	var chatArea string
+	if m.showSidebar && sidebarView != "" {
+		// Side-by-side layout
+		chatWidth := m.width - sidebarWidth - 4 // Account for viewport padding
+		chatStyle := lipgloss.NewStyle().Width(chatWidth)
+		sidebarStyle := lipgloss.NewStyle().Width(sidebarWidth)
+		
+		chatArea = lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			chatStyle.Render(m.viewport.View()),
+			sidebarStyle.Render(sidebarView),
+		)
+	} else {
+		chatArea = m.viewport.View()
 	}
 
 	footer := m.textarea.View()
@@ -532,12 +594,13 @@ func (m Model) View() string {
 	sepStyle := lipgloss.NewStyle().Foreground(t.TextMuted)
 	separator = sepStyle.Render(separator)
 
-	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s",
+	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s",
 		header,
-		status,
-		m.viewport.View(),
+		separator,
+		chatArea,
 		separator,
 		footer,
+		statusBar,
 	)
 }
 
@@ -591,6 +654,16 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "…"
 }
 
 // ── Streaming tea.Msg types ──────────────────────────────────────────────────
