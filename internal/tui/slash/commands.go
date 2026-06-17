@@ -26,7 +26,8 @@ const (
 	ActionOpenTheme                // Open theme picker dialog
 	ActionOpenHelp                 // Open help overlay
 	ActionOpenSession              // Open session dialog
-	ActionCompact                  // Trigger session compaction
+	ActionListSessions             // List available sessions
+	ActionSwitchSession            // Switch to a specific session
 	ActionNewSession               // Create new session
 	ActionShowConfig               // Show current config
 	ActionShowCost                 // Show current session cost
@@ -133,11 +134,16 @@ func (r *Registry) registerDefaults() {
 		},
 		{
 			Name:        "session",
-			Aliases:     []string{"s"},
-			Description: "Switch or list sessions",
+			Aliases:     []string{"s", "sessions"},
+			Description: "List or switch sessions",
 			Shortcut:    "ctrl+s",
+			Args:        "[number]",
 			Handler: func(args string) (string, Action) {
-				return "", ActionOpenSession
+				if args == "" {
+					return "", ActionListSessions
+				}
+				// args contains a session number or ID
+				return args, ActionSwitchSession
 			},
 		},
 		{
@@ -147,14 +153,6 @@ func (r *Registry) registerDefaults() {
 			Shortcut:    "ctrl+n",
 			Handler: func(args string) (string, Action) {
 				return "", ActionNewSession
-			},
-		},
-		{
-			Name:        "compact",
-			Aliases:     []string{"c"},
-			Description: "Compact session history (summarize)",
-			Handler: func(args string) (string, Action) {
-				return "🗜️ Compacting session history...", ActionCompact
 			},
 		},
 		{

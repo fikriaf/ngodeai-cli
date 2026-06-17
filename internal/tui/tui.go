@@ -14,6 +14,7 @@ import (
 	"github.com/fikriaf/ngodeai-cli/internal/export"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/agent"
 	"github.com/fikriaf/ngodeai-cli/internal/llm/provider"
+	"github.com/fikriaf/ngodeai-cli/internal/message"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/autocomplete"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/components/dialog"
 	"github.com/fikriaf/ngodeai-cli/internal/tui/completionpopup"
@@ -340,14 +341,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						themes := m.buildThemeItems()
 						m.themePicker = dialog.NewThemePicker(themes, m.currentTheme)
 						return m, m.themePicker.Init()
-					case slash.ActionOpenSession:
-						// TODO: Implement session dialog
-						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "Session dialog not yet implemented"})
-					case slash.ActionNewSession:
-						// TODO: Implement new session
-						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "New session feature coming soon!"})
-					case slash.ActionCompact:
-						m.messages = append(m.messages, ChatMessage{Role: "system", Content: "🗜️ Session compaction coming soon!"})
+						case slash.ActionListSessions:
+						// List all available sessions
+						sessionsStr, err := m.listSessions()
+						if err != nil {
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ %s", err)})
+						} else {
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: sessionsStr})
+						}
+						case slash.ActionSwitchSession:
+						// Switch to a specific session by number or ID
+						if output == "" {
+							m.messages = append(m.messages, ChatMessage{Role: "system", Content: "❌ Please provide a session number (e.g., `/session 1`)"})
+							break
+						}
+					
+						// Try to parse as number first
+						var sessionNum int
+						if _, err := fmt.Sscanf(output, "%d", &sessionNum); err == nil {
+							// Get session by number
+							sessions, err := m.app.Sessions.List()
+							if err != nil {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ Failed to list sessions: %s", err)})
+								break
+							}
+							if sessionNum < 1 || sessionNum > len(sessions) {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ Invalid session number: %d (valid: 1-%d)", sessionNum, len(sessions))})
+								break
+							}
+							// Load the selected session
+							err = m.loadSession(sessions[sessionNum-1].ID)
+							if err != nil {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ Failed to load session: %s", err)})
+							} else {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("✅ Switched to session %d", sessionNum)})
+							}
+						} else {
+							// Treat as session ID
+							err := m.loadSession(output)
+							if err != nil {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("❌ Failed to load session: %s", err)})
+							} else {
+								m.messages = append(m.messages, ChatMessage{Role: "system", Content: fmt.Sprintf("✅ Switched to session %s", output)})
+							}
+						}
+						case slash.ActionNewSession:
+						// Create a new session
+						m.sessionID = ""
+						m.messages = []ChatMessage{
+							{Role: "system", Content: "🆕 New session started"},
+						}
+						m.promptTokens = 0
+						m.completionTokens = 0
+						m.toolResults = 0
+						m.currentIteration = 0
+						if m.app.CostTracker != nil {
+							m.app.CostTracker.Reset()
+							m.sessionCost = 0
+						}
 					case slash.ActionShowConfig:
 						if m.app.Config != nil {
 							configStr := fmt.Sprintf("📋 **Current Config:**\n```\nWorkingDir: %s\nDataDir: %s\nDebug: %v\nProviders: %d configured\n```", 
@@ -1071,4 +1122,106 @@ func (m Model) sendMessage(content string) tea.Cmd {
 
 		return responseMsg{content: response, sessionID: sessionID}
 	}
+}
+
+// loadSession loads messages from a session into the TUI
+func (m *Model) loadSession(sessionID string) error {
+	if m.app.Messages == nil {
+		return fmt.Errorf("message service not available")
+	}
+
+	// Load messages from database
+	msgs, err := m.app.Messages.List(sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to load messages: %w", err)
+	}
+
+	// Clear current messages and load new ones
+	m.messages = []ChatMessage{
+		{Role: "system", Content: fmt.Sprintf("📂 Loaded session: %s", sessionID)},
+	}
+
+	// Convert database messages to ChatMessage format
+	for _, msg := range msgs {
+		var content string
+		for _, part := range msg.Parts {
+			switch p := part.(type) {
+			case message.TextContent:
+				content += p.Text
+			case message.ToolCall:
+				content += fmt.Sprintf("\n⚡ Tool call: %s\n", p.Name)
+			case message.ToolResult:
+				status := "✓"
+				if p.IsError {
+					status = "✗"
+				}
+				content += fmt.Sprintf("  %s Result: %s\n", status, truncate(p.Content, 100))
+			}
+		}
+
+		// Skip empty messages
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+
+		chatMsg := ChatMessage{
+			Role:      msg.Role,
+			Content:   content,
+			Timestamp: time.Unix(msg.CreatedAt, 0),
+		}
+		if msg.Model.Valid {
+			chatMsg.Model = msg.Model.String
+		}
+		m.messages = append(m.messages, chatMsg)
+	}
+
+	// Update session ID
+	m.sessionID = sessionID
+
+	return nil
+}
+
+// listSessions returns a formatted list of available sessions
+func (m *Model) listSessions() (string, error) {
+	if m.app.Sessions == nil {
+		return "", fmt.Errorf("session service not available")
+	}
+
+	sessions, err := m.app.Sessions.List()
+	if err != nil {
+		return "", fmt.Errorf("failed to list sessions: %w", err)
+	}
+
+	if len(sessions) == 0 {
+		return "💬 **No sessions found**\n\nStart chatting to create your first session!", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("💬 **Available Sessions**\n\n")
+	sb.WriteString("```\n")
+	sb.WriteString(fmt.Sprintf("%-4s  %-20s  %-8s  %-10s  %s\n", "ID", "Title", "Messages", "Tokens", "Updated"))
+	sb.WriteString(fmt.Sprintf("%-4s  %-20s  %-8s  %-10s  %s\n", "----", "--------------------", "--------", "----------", "-------------------"))
+	
+	for i, sess := range sessions {
+		if i >= 20 {
+			sb.WriteString(fmt.Sprintf("\n... and %d more sessions\n", len(sessions)-20))
+			break
+		}
+		
+		title := sess.Title
+		if len(title) > 20 {
+			title = title[:17] + "..."
+		}
+		
+		updated := time.Unix(sess.UpdatedAt, 0).Format("2006-01-02 15:04")
+		totalTokens := sess.PromptTokens + sess.CompletionTokens
+		
+		sb.WriteString(fmt.Sprintf("%-4d  %-20s  %-8d  %-10d  %s\n",
+			i+1, title, sess.MessageCount, totalTokens, updated))
+	}
+	sb.WriteString("```\n\n")
+	sb.WriteString("👉 Use `/session <number>` to switch to a session\n")
+	sb.WriteString("👉 Use `/session delete <number>` to delete a session\n")
+
+	return sb.String(), nil
 }
